@@ -382,7 +382,9 @@ def _has_fabricated_citation(body: str, context_blob: str) -> Optional[str]:
 
 
 _NEW_ADDITION_RE = re.compile(
-    r"(?:we'?ve added|we'?ve introduced|since then we'?ve|we now (?:have|offer)|"
+    r"(?:we'?ve\s+(?:\w+\s+){0,2}(?:added|introduced|launched|started|got)|"
+    r"we\s+now\s+(?:\w+\s+){0,2}(?:have|offer)|"
+    r"since\s+then\s+we'?ve\s+(?:\w+\s+){0,2}(?:added|introduced)|"
     r"new (?:class|service|instructor|trainer|program|batch|session)es?|"
     r"introduced a new|hum ne|naya(?:\s+\w+)?\s+shuru)"
     r"\s+((?:(?!\bplease\b|\breply\b|\band\b\s)[\w'/,]+\s*){1,8})",
@@ -390,16 +392,20 @@ _NEW_ADDITION_RE = re.compile(
 )
 _STOPWORDS = {"a", "an", "the", "new", "we", "you", "your", "for", "to", "and", "at",
               "with", "plus", "led", "by", "class", "classes", "service", "services",
-              "of", "our", "is", "are", "this", "that", "perfect", "still", "certified"}
+              "of", "our", "is", "are", "this", "that", "perfect", "still", "certified",
+              "just", "now", "recently"}
 
 def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict, is_customer_facing: bool) -> Optional[str]:
     """For customer-facing messages: flag any claim that the merchant added/introduced
-    something new, unless that specific thing is verifiable in the merchant's OWN data
-    (offers, signals, conversation history) -- not just the category-wide catalog/vocab.
-    Two real observed failures this guards against: a category-catalog item ('Free Body
-    Composition Analysis') presented as merchant-confirmed, and a fully free-form
-    invention ('a weekly yoga class led by certified instructors') that matched no
-    catalog item at all but was still never in this merchant's own data."""
+    something new, OR any category-vocabulary "service word" (yoga, HIIT, aligner, etc.)
+    used as if it's specifically this merchant's, unless verifiable in the merchant's OWN
+    data (offers, signals, conversation history, review themes) or the customer's own
+    service history. Three real observed failures fixed progressively: a category-catalog
+    item presented as merchant-confirmed; a free-form invented class matching no catalog
+    item; and the same invented class rephrased with an inserted word ("we've JUST added")
+    that broke a too-rigid phrase regex. Given LLM phrasing varies endlessly, this also
+    checks the underlying vocabulary noun directly, not just the surrounding verb phrase,
+    as a second line of defense."""
     if not is_customer_facing:
         return None
     norm = lambda s: re.sub(r"[-–—]", " ", s).lower()
@@ -412,7 +418,7 @@ def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict,
         json.dumps(merchant.get("review_themes", []), ensure_ascii=False),
     ]))
 
-    # 1. Exact category-catalog item presented as merchant's own (narrow, high-confidence)
+    # 1. Exact category-catalog item presented as merchant's own
     active_offer_titles = norm(" ".join(
         o.get("title", "") for o in merchant.get("offers", []) if o.get("status") == "active"
     ))
@@ -421,16 +427,23 @@ def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict,
         if len(title_key) >= 6 and title_key in body_norm and title_key not in active_offer_titles:
             return item.get("title")
 
-    # 2. General "we added/introduced something new" pattern, checked against the
-    # merchant's OWN data only (broader net, catches free-form inventions too)
+    # 2. "We added/introduced X" pattern (tolerant of inserted words like "just"/"recently")
     for match in _NEW_ADDITION_RE.finditer(body):
         noun_phrase = match.group(1)
         tokens = [t.lower() for t in re.findall(r"[A-Za-z]+", noun_phrase)
                   if t.lower() not in _STOPWORDS and len(t) > 2]
-        if not tokens:
-            continue
-        if not any(t in merchant_own_blob for t in tokens):
+        if tokens and not any(t in merchant_own_blob for t in tokens):
             return match.group(0).strip()
+
+    # 3. Second line of defense: any category vocab_allowed "service word" (yoga, HIIT,
+    # aligner, whitening, ...) appearing in the body but nowhere in the merchant's own
+    # data. Catches phrasings the verb-pattern regex above still misses.
+    vocab_words = [v.lower() for v in category.get("voice", {}).get("vocab_allowed", [])
+                   if len(v) > 3]
+    for word in vocab_words:
+        if word in body_norm and word not in merchant_own_blob:
+            return f"category vocabulary term '{word}' used as if merchant-specific"
+
     return None
 
 
