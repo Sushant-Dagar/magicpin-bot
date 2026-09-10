@@ -533,8 +533,8 @@ def compose(
         kind_guidance=kind_guidance,
     )
 
-    def _try_llm_compose(extra_instruction: str = "") -> Optional[dict]:
-        """One LLM attempt. Returns parsed dict, or None on any failure."""
+    def _try_llm_compose(extra_instruction: str = "") -> tuple:
+        """One LLM attempt. Returns (parsed dict or None, error string or None)."""
         full_prompt = prompt + (f"\n\n{extra_instruction}" if extra_instruction else "")
         try:
             raw = _llm_complete(SYSTEM_PROMPT, full_prompt, temperature=0.0)
@@ -543,14 +543,14 @@ def compose(
             m = re.search(r'\{[\s\S]*\}', raw)
             if m:
                 raw = m.group()
-            return json.loads(raw)
-        except Exception:
-            return None
+            return json.loads(raw), None
+        except Exception as e:
+            return None, str(e)
 
-    result = _try_llm_compose()
+    result, err = _try_llm_compose()
     if result is None:
         result = _fallback_compose(category, merchant, trigger, customer)
-        result["rationale"] += " [LLM error: initial attempt failed]"
+        result["rationale"] += f" [LLM error: {err}]"
 
     # Ensure suppression_key is always set
     if not result.get("suppression_key"):
@@ -591,7 +591,7 @@ def compose(
             "in the category/merchant/trigger/customer context given. Do not invent any "
             "new class, service, instructor, or citation. Return JSON only."
         )
-        retry_result = _try_llm_compose(retry_instruction)
+        retry_result, retry_err = _try_llm_compose(retry_instruction)
         if retry_result is not None:
             if not retry_result.get("suppression_key"):
                 retry_result["suppression_key"] = result["suppression_key"]
@@ -614,8 +614,9 @@ def compose(
             f"unverifiable citation '{bad_citation}'" if bad_citation
             else f"claimed unconfirmed merchant service '{bad_service}' (only in category catalog, not merchant's own active offers)"
         )
+        retry_note = f"; retry error: {retry_err}" if retry_err else "; retry still fabricated"
         fallback["rationale"] += (
-            f" [LLM output rejected twice: {reason}, not traceable to pushed context; retry also failed or still fabricated]"
+            f" [LLM output rejected twice: {reason}, not traceable to pushed context{retry_note}]"
         )
         return fallback
 
