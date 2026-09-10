@@ -117,6 +117,13 @@ RULES (violating any costs heavy scoring penalty):
     opinion, not just a mail-merge" quality is the single highest signal of category understanding.
 18. Do not stack more than one ask on the merchant/customer. One question, one CTA, one artifact
     offered — not three.
+19. CategoryContext's offer_catalog and vocab_allowed are STYLE/PATTERN REFERENCE ONLY — canonical
+    examples of what offers/vocabulary look like in this vertical. They are NOT evidence that THIS
+    merchant currently has that specific offer, class, or service. Only claim a specific service,
+    class, or offer exists for this merchant if it appears in the merchant's own `offers` list
+    (status=active) or elsewhere in their own MerchantContext. This matters most for
+    customer-facing messages: never tell a customer "we've added X" or "we now offer X" unless X is
+    confirmed in the merchant's own active offers — a customer may show up expecting it.
 """
 
 COMPOSE_PROMPT = """=== CONTEXT ===
@@ -329,6 +336,79 @@ def strip_urls(body: str) -> str:
     return re.sub(r"\s{2,}", " ", _URL_RE.sub("", body)).strip()
 
 
+def _context_blob(category: dict, merchant: dict, trigger: dict, customer: Optional[dict]) -> str:
+    """Flattened lowercase text of everything actually provided, for fabrication checks."""
+    parts = [
+        json.dumps(category, ensure_ascii=False),
+        json.dumps(merchant, ensure_ascii=False),
+        json.dumps(trigger, ensure_ascii=False),
+    ]
+    if customer:
+        parts.append(json.dumps(customer, ensure_ascii=False))
+    return " ".join(parts).lower()
+
+
+# Citation-style clauses the LLM tends to invent when it wants to sound authoritative:
+# "— <Proper Noun ...>, <Month> <Year>" or "circular NNN/YYYY". If the distinctive proper
+# noun in a citation doesn't appear anywhere in the actual context we gave the model, the
+# citation -- and therefore likely the claim it's attached to -- is fabricated. This is a
+# real, observed failure mode (GPT-OSS-120B via Groq invented a "GST Council circular
+# 224/2026" and a "Zomato partner update, Apr 2026" that exist nowhere in the pushed
+# context), not a hypothetical edge case.
+_CITATION_RE = re.compile(
+    r"[—–-]\s*([A-Z][A-Za-z&.]+(?:\s+[A-Z][A-Za-z&.]+){0,4}"
+    r"(?:\s*,?\s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s*\d{4})?)"
+)
+_REGULATION_RE = re.compile(r"\bcircular\s+[\w/.\-]+\b", re.IGNORECASE)
+
+def _has_fabricated_citation(body: str, context_blob: str) -> Optional[str]:
+    """Returns the offending fragment if body cites something untraceable to context."""
+    reg_match = _REGULATION_RE.search(body)
+    if reg_match and "circular" not in context_blob:
+        return reg_match.group()
+    for match in _CITATION_RE.finditer(body):
+        citation_text = match.group(1)
+        tokens = [
+            t for t in re.findall(r"[A-Za-z]+", citation_text)
+            if t.lower() not in ("jan", "feb", "mar", "apr", "may", "jun", "jul",
+                                  "aug", "sep", "oct", "nov", "dec")
+            and len(t) > 2
+        ]
+        if not tokens:
+            continue
+        if not any(t.lower() in context_blob for t in tokens):
+            return citation_text
+    return None
+
+
+def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict, is_customer_facing: bool) -> Optional[str]:
+    """For customer-facing messages: flag if the body presents a category-catalog offer/class
+    as something THIS merchant has, when it isn't in the merchant's own active offers.
+    (Real observed failure: a gym message told a customer 'we've added a new HIIT class' --
+    HIIT was only in the category's generic vocab_allowed list, not this merchant's own data.)"""
+    if not is_customer_facing:
+        return None
+    active_offer_titles = " ".join(
+        o.get("title", "") for o in merchant.get("offers", []) if o.get("status") == "active"
+    ).lower()
+    # Normalize hyphens/dashes to spaces so "body-composition" matches catalog's "body composition"
+    norm = lambda s: re.sub(r"[-–—]", " ", s).lower()
+    body_norm = norm(body)
+    active_offer_titles = norm(active_offer_titles)
+    claim_markers = ["we've added", "we now offer", "we've introduced", "new class",
+                      "hum ab", "naya class"]
+    if not any(m in body_norm for m in claim_markers):
+        return None
+    for item in category.get("offer_catalog", []):
+        title = item.get("title", "")
+        title_key = norm(re.sub(r"@.*|₹.*", "", title).strip())
+        if len(title_key) < 4:
+            continue
+        if title_key in body_norm and title_key not in active_offer_titles:
+            return title
+    return None
+
+
 def compose(
     category: dict,
     merchant: dict,
@@ -441,6 +521,26 @@ def compose(
         result["send_as"] = "vera"
 
     result["body"] = strip_urls(smart_trim(result.get("body", "")))
+
+    # Anti-fabrication guardrail: if the LLM cited something untraceable to the actual
+    # context (invented regulation, invented partner program, invented source), the
+    # message fails the challenge's core "never fabricate" rule regardless of how
+    # polished it reads. Discard it and use the deterministic, grounded fallback instead
+    # -- a plainer message that's true beats a compelling one that's fabricated.
+    blob = _context_blob(category, merchant, trigger, customer)
+    bad_citation = _has_fabricated_citation(result["body"], blob)
+    bad_service = _has_unconfirmed_merchant_service(
+        result["body"], category, merchant, is_customer_facing=bool(customer)
+    )
+    if bad_citation or bad_service:
+        fallback = _fallback_compose(category, merchant, trigger, customer)
+        reason = (
+            f"unverifiable citation '{bad_citation}'" if bad_citation
+            else f"claimed unconfirmed merchant service '{bad_service}' (only in category catalog, not merchant's own active offers)"
+        )
+        fallback["rationale"] += f" [LLM output rejected: {reason}, not traceable to pushed context]"
+        return fallback
+
     if not result["body"].strip():
         # URL-stripping or a degenerate LLM output left nothing usable — fall back rather
         # than ship an empty body (empty body = malformed, -2 penalty).
