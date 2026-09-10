@@ -8,7 +8,7 @@ import os
 import re
 from typing import Optional
 
-from composer import _llm_complete, SYSTEM_PROMPT, smart_trim
+from composer import _llm_complete, SYSTEM_PROMPT, smart_trim, strip_urls
 
 # Auto-reply detection
 AUTO_REPLY_PATTERNS = [
@@ -144,7 +144,8 @@ RULES:
 - "action": "wait" — back off; add "wait_seconds" key (int)
 - "action": "end" — close the conversation gracefully
 - body required only for "send"; omit for "wait"/"end"
-- body: concise WhatsApp reply, max ~200 chars
+- body: concise WhatsApp reply. No hard character limit, no padding — say what's needed and stop.
+- NEVER include a URL/link — automatic hard fail.
 - NO preamble, NO re-introduction
 - Honor the conversation thread — answer what was asked
 - If merchant said YES/confirmed → switch to ACTION mode, deliver the artifact
@@ -207,20 +208,24 @@ def respond(
             body = (f"Perfect — you're booked for {slot_txt} at {mname}. "
                     "We'll send a reminder before your visit; reply here anytime to reschedule. "
                     "See you soon!")
-            return {"action": "send", "body": smart_trim(body), "cta": "none",
+            return {"action": "send", "body": strip_urls(smart_trim(body)), "cta": "none",
                     "rationale": "Customer confirmed — booking locked with their stated slot."}
         # anything else from a customer: keep it warm and slot-focused, no LLM needed
         body = ("Sure — " + (f"open slots: {' or '.join(slots[:2])}. Reply 1"
                 + (" or 2" if len(slots) > 1 else "") + " to confirm."
                 if slots else "just reply with a day and time that suits you and we'll book it."))
-        return {"action": "send", "body": smart_trim(body), "cta": "multi_choice_slot",
+        return {"action": "send", "body": strip_urls(smart_trim(body)), "cta": "multi_choice_slot",
                 "rationale": "Customer conversation — low-friction slot nudge."}
 
-    # 1. Hostile message → end immediately
+    # 1. Hostile message → end immediately, and flag the merchant for suppression.
+    # (Phase-4 spec's own reference rationale: "closing without further engagement.
+    # Suppressing all triggers for this merchant for 30 days.")
     if is_hostile(merchant_message):
         return {
             "action": "end",
-            "rationale": "Merchant expressed frustration/opt-out. Closing conversation and suppressing.",
+            "suppress_merchant": True,
+            "rationale": ("Merchant expressed frustration/opt-out. Closing conversation and "
+                          "suppressing all future triggers for this merchant."),
         }
 
     # 2. Auto-reply detection
@@ -243,7 +248,7 @@ def respond(
             mname = merchant.get("identity", {}).get("name", "") if merchant else ""
             return {
                 "action": "send",
-                "body": f"Looks like an auto-reply 😊 When {mname or 'the owner'} sees this, just reply YES to continue.",
+                "body": strip_urls(f"Looks like an auto-reply 😊 When {mname or 'the owner'} sees this, just reply YES to continue."),
                 "cta": "binary_yes_no",
                 "rationale": "Detected first auto-reply; one prompt to flag it for the owner.",
             }
@@ -291,7 +296,9 @@ def respond(
             last = get_last_bot_body(turns)
             if last and result.get("body", "").strip() == last.strip():
                 result["body"] = result["body"] + " — want me to go ahead?"
-            result["body"] = smart_trim(result.get("body", ""))
+            result["body"] = strip_urls(smart_trim(result.get("body", "")))
+            if not result["body"].strip():
+                raise ValueError("empty body after URL-stripping")
 
         return result
 
@@ -311,7 +318,7 @@ def respond(
                 "reply YES and I'll send it now.")
         return {
             "action": "send",
-            "body": smart_trim(body),
+            "body": strip_urls(smart_trim(body)),
             "cta": "binary_yes_no",
             "rationale": f"Grounded fallback (mirrors merchant specifics). [LLM error: {e}]",
         }

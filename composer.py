@@ -10,13 +10,21 @@ import os
 import re
 from typing import Optional
 
-# LLM client (supports OpenAI + Anthropic)
+# Both /v1/tick and /v1/reply have a 30s budget from the judge. Keep the LLM call well
+# under that so there's still time to parse/validate and return — a slow provider must
+# fail fast into the deterministic fallback rather than blow the whole request.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "18"))
+
+
+# LLM client (supports OpenAI + Anthropic + Groq)
 def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
 
     if provider == "anthropic":
         import anthropic
-        client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY", ""))
+        client = anthropic.Anthropic(
+            api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS
+        )
         model = os.getenv("LLM_MODEL", "claude-3-5-sonnet-20241022")
         resp = client.messages.create(
             model=model, max_tokens=1024,
@@ -33,6 +41,7 @@ def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
         client = OpenAI(
             api_key=api_key,
             base_url="https://api.groq.com/openai/v1",
+            timeout=LLM_TIMEOUT_SECONDS,
         )
         model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
         # Groq doesn't support response_format=json_object for all models,
@@ -48,7 +57,7 @@ def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
 
     else:  # default openai
         from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS)
         model = os.getenv("LLM_MODEL", "gpt-4o")
         resp = client.chat.completions.create(
             model=model, temperature=temperature,
@@ -67,21 +76,47 @@ engage Indian merchants or their customers. You ALWAYS return valid JSON with th
 {"body": "...", "cta": "...", "send_as": "...", "suppression_key": "...", "rationale": "..."}
 
 RULES (violating any costs heavy scoring penalty):
-1. body — the WhatsApp message text. Concise, no preamble ("Hope you're well" etc.). HARD LIMIT 300 characters — bodies over 320 chars FAIL schema validation.
+1. body — the WhatsApp message text. No preamble ("Hope you're well" etc.), no re-introduction.
+   There is NO hard character limit — a longer message packed with real specifics beats a short
+   generic one. But don't pad: every sentence must earn its place. As a rough feel, the best
+   examples run ~250-450 characters; go longer only if you have that many real, non-fabricated
+   specifics to include.
 2. cta — one of: "binary_yes_no", "binary_confirm_cancel", "open_ended", "multi_choice_slot", "none"
 3. send_as — "vera" for merchant-facing, "merchant_on_behalf" for customer-facing
 4. suppression_key — copy from the trigger's suppression_key
-5. rationale — 1-2 sentences explaining the compulsion lever used and why this message fits
-6. NEVER fabricate data not present in the context JSON provided
-7. NEVER use taboo words from the category voice profile
-8. ALWAYS use the merchant/customer's actual name
-9. ALWAYS anchor on at least one specific number, date, or source citation from the contexts
-10. Hindi-English code-mix is ENCOURAGED for hi/hi-en merchants and customers
-11. The last sentence should be the CTA — buried CTAs lose points
-12. "X% off" generic discounts score LOWER than "Service @ ₹price" specifics
-13. For customer-facing messages: honor language preference, preferred slot times, relationship state
-14. For research/compliance triggers: include the source citation at end (e.g. — JIDA Oct 2026 p.14)
-15. Emoji: 1 max, only if it fits the category (🦷 dental, 💇 salon, 🏋️ gym — not for pharmacies)
+5. rationale — 1-2 sentences explaining the compulsion lever used and why this message fits.
+   Must accurately describe what the body actually does — a mismatched rationale is penalized.
+6. NEVER fabricate data not present in the context JSON provided. Every number, date, name, or
+   claim must trace back to something literally present in the context. If you compute a derived
+   number (e.g. "22 of your 240 chronic-Rx customers"), it must be arithmetically consistent with
+   the context values, not invented.
+7. NEVER use taboo words from the category voice profile.
+8. NEVER include a URL/link of any kind in body. Meta rejects them — this is an automatic hard
+   fail for the message, worse than any other mistake. If you want to reference content, describe
+   it instead of linking it.
+9. ALWAYS use the merchant's/owner's/customer's actual first name from the context. A generic
+   "Hi" or "Hello there" with no name loses points — never skip the name if one exists in context.
+10. ALWAYS anchor on at least one specific, verifiable number, date, or source citation from the
+    contexts. For any research or compliance-type trigger, you MUST include the source citation
+    (e.g. "— JIDA Oct 2026 p.14", "DCI circular 2026-11-04") — omitting it caps the message's
+    specificity score.
+11. Hindi-English code-mix is ENCOURAGED for hi/hi-en merchants and customers — don't force pure
+    English on a merchant/customer whose language preference includes Hindi.
+12. Exactly ONE primary call-to-action, and it must land in the LAST sentence — buried or stacked
+    CTAs ("Reply YES for X, NO for Y, or tell us Z") lose points. One clear, low-friction next step.
+13. "X% off" generic discounts score LOWER than "Service @ ₹price" specifics — always prefer the
+    concrete service+price from the offer catalog when one exists and is relevant.
+14. For customer-facing messages: honor language preference, preferred slot times, and
+    relationship/consent state exactly as given — never invent customer details not in context.
+15. Emoji: 1 max, only if it fits the category (🦷 dental, 💇 salon, 🏋️ gym, 💍 bridal — never for
+    pharmacies, which stay trustworthy/precise with no emoji).
+16. Use the category's own vocabulary (voice.vocab_allowed) naturally where it fits — using the
+    right domain terms signals real category understanding and is explicitly rewarded.
+17. Where the data supports it, add a judgment call, not just a template fill — e.g. recommending
+    a merchant SKIP a promo because the data says it will underperform. This "the bot has an
+    opinion, not just a mail-merge" quality is the single highest signal of category understanding.
+18. Do not stack more than one ask on the merchant/customer. One question, one CTA, one artifact
+    offered — not three.
 """
 
 COMPOSE_PROMPT = """=== CONTEXT ===
@@ -257,10 +292,14 @@ def _build_customer_block(customer: Optional[dict]) -> str:
     )
 
 
-MAX_BODY = 315
+# The challenge spec is explicit: "No hard body-length cap. Messages are judged on
+# quality, specificity, and relevance." (challenge-testing-brief §Failure-mode F.3).
+# This is only a sanity ceiling against a runaway/looping LLM output, NOT a target —
+# the real winning examples in case-studies.md run 250-450 chars freely.
+SANITY_CEILING = 900
 
-def smart_trim(body: str, limit: int = MAX_BODY) -> str:
-    """Trim at sentence boundaries; always keep first sentence + final CTA sentence."""
+def smart_trim(body: str, limit: int = SANITY_CEILING) -> str:
+    """Only trims pathologically long output; never touches normal-length messages."""
     if len(body) <= limit:
         return body
     sents = re.split(r"(?<=[.!?]) +", body.strip())
@@ -278,6 +317,16 @@ def smart_trim(body: str, limit: int = MAX_BODY) -> str:
         first = first[: limit - len(last) - 3].rstrip() + "…"
         out = first + " " + last
     return out
+
+
+_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
+
+def strip_urls(body: str) -> str:
+    """Hard requirement (F.4): any URL in body is an automatic -3 fail. Belt-and-suspenders
+    against the LLM slipping one in — strip it rather than let the message ship broken."""
+    if not body:
+        return body
+    return re.sub(r"\s{2,}", " ", _URL_RE.sub("", body)).strip()
 
 
 def compose(
@@ -391,7 +440,11 @@ def compose(
     elif not result.get("send_as"):
         result["send_as"] = "vera"
 
-    result["body"] = smart_trim(result.get("body", ""))
+    result["body"] = strip_urls(smart_trim(result.get("body", "")))
+    if not result["body"].strip():
+        # URL-stripping or a degenerate LLM output left nothing usable — fall back rather
+        # than ship an empty body (empty body = malformed, -2 penalty).
+        result = _fallback_compose(category, merchant, trigger, customer)
     return result
 
 

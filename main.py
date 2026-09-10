@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from composer import compose
+from composer import compose, strip_urls
 from conversation_handlers import respond, is_auto_reply, is_hostile
 
 # ---------------------------------------------------------------------------
@@ -40,6 +40,10 @@ merchant_auto_reply_counts: Dict[str, int] = {}
 # suppression keys already sent this session (dedup)
 sent_suppression_keys: set = set()
 
+# merchants who went hostile — no further proactive sends to them at all
+# (phase-4 spec: "suppressing all future triggers for this merchant")
+hostile_merchants: set = set()
+
 STATE_FILE = _Path(os.getenv("STATE_FILE", "bot_state.json"))
 
 def _save_state():
@@ -50,6 +54,7 @@ def _save_state():
             "conversations": conversations,
             "suppression": sorted(sent_suppression_keys),
             "auto_counts": merchant_auto_reply_counts,
+            "hostile_merchants": sorted(hostile_merchants),
         }), encoding="utf-8")
         tmp.replace(STATE_FILE)
     except Exception as e:
@@ -65,6 +70,7 @@ def _load_state():
         conversations.update(s.get("conversations", {}))
         sent_suppression_keys.update(s.get("suppression", []))
         merchant_auto_reply_counts.update(s.get("auto_counts", {}))
+        hostile_merchants.update(s.get("hostile_merchants", []))
         print(f"[state] restored {len(contexts)} contexts, {len(conversations)} conversations")
     except Exception as e:
         print(f"[state] load failed: {e}")
@@ -143,18 +149,22 @@ def healthz():
 @app.get("/v1/metadata")
 def metadata():
     return {
-        "team_name": "Vera AI",
-        "team_members": ["Challenger"],
+        "team_name": os.getenv("TEAM_NAME", "Sushant Dagar"),
+        "team_members": [os.getenv("TEAM_MEMBER_1", "Sushant Dagar")],
         "model": os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
         "approach": (
-            "4-context LLM composer (category+merchant+trigger+customer) with "
-            "per-trigger-kind prompt dispatch. Rule-based auto-reply detection "
-            "(merchant-level counter survives conv_id changes), intent-transition "
-            "routing, hostile-message handling. Adaptive to context version updates."
+            "4-context LLM composer (category+merchant+trigger+customer) with per-trigger-kind "
+            "prompt dispatch, no hard body-length cap, hard URL guard, and a checklist-driven "
+            "system prompt (mandatory source citations, named-provenance numbers, single "
+            "last-sentence CTA, category vocabulary). Rule-based auto-reply detection "
+            "(merchant-level counter survives conv_id changes), intent-transition routing, "
+            "hostile-message handling with merchant-level suppression, deterministic "
+            "customer-facing slot booking. Adaptive to context version updates; deterministic "
+            "fallback composer with real payload-derived facts when the LLM is unavailable."
         ),
-        "contact_email": "challenger@example.com",
-        "version": "1.1.0",
-        "submitted_at": "2026-04-26T08:00:00Z",
+        "contact_email": os.getenv("TEAM_EMAIL", "challenger@example.com"),
+        "version": "2.0.0",
+        "submitted_at": _now_iso(),
     }
 
 
@@ -202,6 +212,8 @@ def tick(body: TickBody):
         customer_id = trg.get("customer_id")
         if not merchant_id:
             continue
+        if merchant_id in hostile_merchants:
+            continue
 
         conv_id = f"conv_{merchant_id}_{trg_id}"
         existing_conv = conversations.get(conv_id)
@@ -236,7 +248,11 @@ def tick(body: TickBody):
         if customer_id:
             send_as = "merchant_on_behalf"
 
-        body_text = body_text[:320] if len(body_text) > 320 else body_text
+        # No hard body-length cap per spec (testing-brief F.3) — compose() already
+        # applies a generous sanity ceiling. Just re-run the URL guard defensively.
+        body_text = strip_urls(body_text)
+        if not body_text:
+            continue
         action_entry = {
             "conversation_id": conv_id,
             "merchant_id": merchant_id,
@@ -344,6 +360,8 @@ def reply(body: ReplyBody):
         # Also clear the merchant auto-reply count so future conversations start fresh
         if resolved_merchant_id:
             merchant_auto_reply_counts.pop(resolved_merchant_id, None)
+            if result.get("suppress_merchant"):
+                hostile_merchants.add(resolved_merchant_id)
 
     response = {"action": action, "rationale": result.get("rationale", "")}
     if action == "send":
@@ -362,4 +380,5 @@ def teardown():
     conversations.clear()
     sent_suppression_keys.clear()
     merchant_auto_reply_counts.clear()
+    hostile_merchants.clear()
     return {"wiped": True}

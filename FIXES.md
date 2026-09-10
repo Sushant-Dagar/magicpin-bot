@@ -1,3 +1,42 @@
+# Vera bot — fix history
+
+## v2.0 fixes (against the actual challenge ZIP — challenge-brief.md, challenge-testing-brief.md,
+## examples/case-studies.md, examples/api-call-examples.md, judge_simulator.py)
+
+1. **Removed a fictitious hard body-length cap.** Both `composer.py`'s system prompt
+   ("HARD LIMIT 300 chars, fails schema validation over 320") and `main.py`'s `/v1/tick`
+   handler (`body_text[:320]`) were silently truncating every message. The actual spec
+   (testing-brief, failure-mode F.3) says explicitly: *"No hard body-length cap. Messages
+   are judged on quality, specificity, and relevance."* The top-scoring case studies run
+   250-450 characters. Replaced with a 900-char sanity ceiling that only guards against a
+   genuinely runaway LLM response — never trims a normal message.
+2. **Added a URL guard.** Failure-mode F.4: any URL in `body` is an automatic hard fail,
+   -3 penalty ("Meta would reject it"). Nothing previously prevented this. Added
+   `strip_urls()` in `composer.py`, applied to every body-producing path in both
+   `composer.py` and `conversation_handlers.py`, plus a defensive re-check in `main.py`'s
+   `/v1/tick`.
+3. **Rewrote the system prompt** around the literal "cross-case patterns" checklist from
+   `examples/case-studies.md` §"Cross-case patterns the judge looks for": mandatory source
+   citation on research/compliance triggers (uncited = capped at 7), numbers must have
+   visible provenance (no unexplained figures), owner/customer first name mandatory
+   (generic "Hi" loses a merchant-fit point), exactly one CTA landing in the last sentence,
+   category-correct vocabulary use, and rewarding an actual judgment call (e.g. "skip the
+   promo, the data says it'll underperform") over pure template-filling.
+4. **Merchant-level hostile suppression.** The phase-4 replay spec's own reference
+   rationale for a hostile exit says "suppressing all triggers for this merchant for 30
+   days" — the bot only closed that one conversation. Added a persistent
+   `hostile_merchants` set; `/v1/tick` now skips any trigger for a merchant who has gone
+   hostile in this test run.
+5. **LLM call timeouts.** Neither the OpenAI, Anthropic, nor Groq client calls had an
+   explicit timeout, risking blowing the judge's 30s-per-call budget on a slow provider.
+   Added an 18s timeout (env `LLM_TIMEOUT_SECONDS`) so a stuck call fails fast into the
+   deterministic fallback with time to spare.
+6. **Empty-body guard after URL-stripping.** If stripping a URL left an empty body (edge
+   case), `compose()`/`respond()` now fall back rather than ship an empty body (which is
+   itself a -2 malformed-response penalty).
+
+---
+
 # Arpit's bot — v1.2 fixes (against magicpin judge feedback)
 
 1. **320-char hard limit** — `smart_trim()` caps every body (tick + reply) at 315
