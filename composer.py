@@ -10,10 +10,10 @@ import os
 import re
 from typing import Optional
 
-# Both /v1/tick and /v1/reply have a 30s budget from the judge. Keep the LLM call well
-# under that so there's still time to parse/validate and return — a slow provider must
-# fail fast into the deterministic fallback rather than blow the whole request.
-LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "18"))
+# Both /v1/tick and /v1/reply have a 30s budget from the judge. compose() can now make up
+# to 2 LLM calls (initial + one retry after a rejected fabrication), so each call's timeout
+# must leave room for both to fit under budget with margin for parsing/network overhead.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
 
 
 # LLM client (supports OpenAI + Anthropic + Groq)
@@ -533,20 +533,24 @@ def compose(
         kind_guidance=kind_guidance,
     )
 
-    try:
-        raw = _llm_complete(SYSTEM_PROMPT, prompt, temperature=0.0)
-        # strip markdown fences if any
-        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
-        raw = re.sub(r"\n?```$", "", raw.strip())
-        # extract first JSON object if there's surrounding text
-        m = re.search(r'\{[\s\S]*\}', raw)
-        if m:
-            raw = m.group()
-        result = json.loads(raw)
-    except Exception as e:
-        # fallback — rule-based message
+    def _try_llm_compose(extra_instruction: str = "") -> Optional[dict]:
+        """One LLM attempt. Returns parsed dict, or None on any failure."""
+        full_prompt = prompt + (f"\n\n{extra_instruction}" if extra_instruction else "")
+        try:
+            raw = _llm_complete(SYSTEM_PROMPT, full_prompt, temperature=0.0)
+            raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
+            raw = re.sub(r"\n?```$", "", raw.strip())
+            m = re.search(r'\{[\s\S]*\}', raw)
+            if m:
+                raw = m.group()
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    result = _try_llm_compose()
+    if result is None:
         result = _fallback_compose(category, merchant, trigger, customer)
-        result["rationale"] += f" [LLM error: {e}]"
+        result["rationale"] += " [LLM error: initial attempt failed]"
 
     # Ensure suppression_key is always set
     if not result.get("suppression_key"):
@@ -561,22 +565,58 @@ def compose(
     result["body"] = strip_urls(smart_trim(result.get("body", "")))
 
     # Anti-fabrication guardrail: if the LLM cited something untraceable to the actual
-    # context (invented regulation, invented partner program, invented source), the
+    # context (invented regulation, invented partner program, invented service), the
     # message fails the challenge's core "never fabricate" rule regardless of how
-    # polished it reads. Discard it and use the deterministic, grounded fallback instead
-    # -- a plainer message that's true beats a compelling one that's fabricated.
+    # polished it reads. Rather than dropping straight to the plain deterministic
+    # fallback (safe but reads like a data dump — costs Category Fit / Engagement),
+    # give the LLM one retry with explicit feedback about exactly what was fabricated.
+    # Only fall back to the mechanical version if the retry ALSO fails the check.
     blob = _context_blob(category, merchant, trigger, customer)
-    bad_citation = _has_fabricated_citation(result["body"], blob)
-    bad_service = _has_unconfirmed_merchant_service(
-        result["body"], category, merchant, is_customer_facing=bool(customer)
-    )
+
+    def _check(body: str) -> tuple:
+        bad_citation = _has_fabricated_citation(body, blob)
+        bad_service = _has_unconfirmed_merchant_service(
+            body, category, merchant, is_customer_facing=bool(customer)
+        )
+        return bad_citation, bad_service
+
+    bad_citation, bad_service = _check(result["body"])
+
     if bad_citation or bad_service:
+        offending = bad_citation or bad_service
+        retry_instruction = (
+            f"Your previous attempt included this unverifiable claim: \"{offending}\". "
+            "It does not appear anywhere in the context provided above. Rewrite the "
+            "message using ONLY facts, offers, and services that are literally present "
+            "in the category/merchant/trigger/customer context given. Do not invent any "
+            "new class, service, instructor, or citation. Return JSON only."
+        )
+        retry_result = _try_llm_compose(retry_instruction)
+        if retry_result is not None:
+            if not retry_result.get("suppression_key"):
+                retry_result["suppression_key"] = result["suppression_key"]
+            if customer and not retry_result.get("send_as"):
+                retry_result["send_as"] = "merchant_on_behalf"
+            elif not retry_result.get("send_as"):
+                retry_result["send_as"] = "vera"
+            retry_result["body"] = strip_urls(smart_trim(retry_result.get("body", "")))
+            retry_bad_citation, retry_bad_service = _check(retry_result["body"])
+            if not (retry_bad_citation or retry_bad_service) and retry_result["body"].strip():
+                retry_result["rationale"] = (
+                    retry_result.get("rationale", "")
+                    + f" [Retried after first attempt was rejected for: '{offending}']"
+                )
+                return retry_result
+
+        # Retry either failed outright or still fabricated -- use the safe fallback.
         fallback = _fallback_compose(category, merchant, trigger, customer)
         reason = (
             f"unverifiable citation '{bad_citation}'" if bad_citation
             else f"claimed unconfirmed merchant service '{bad_service}' (only in category catalog, not merchant's own active offers)"
         )
-        fallback["rationale"] += f" [LLM output rejected: {reason}, not traceable to pushed context]"
+        fallback["rationale"] += (
+            f" [LLM output rejected twice: {reason}, not traceable to pushed context; retry also failed or still fabricated]"
+        )
         return fallback
 
     if not result["body"].strip():
