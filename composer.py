@@ -13,7 +13,11 @@ from typing import Optional
 # Both /v1/tick and /v1/reply have a 30s budget from the judge. compose() can now make up
 # to 2 LLM calls (initial + one retry after a rejected fabrication), so each call's timeout
 # must leave room for both to fit under budget with margin for parsing/network overhead.
-LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
+# /v1/tick also now runs multiple triggers' compose() calls CONCURRENTLY (see main.py),
+# so the worst case for the whole tick is bounded by the SLOWEST single trigger's two
+# calls, not the sum across all triggers -- but that single worst case still needs to
+# fit comfortably under 30s including all other tick-handler overhead.
+LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "10"))
 
 
 # LLM client (supports OpenAI + Anthropic + Groq)

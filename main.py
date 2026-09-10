@@ -7,6 +7,7 @@ import os
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -197,7 +198,15 @@ def push_context(body: ContextBody):
 
 @app.post("/v1/tick")
 def tick(body: TickBody):
-    actions = []
+    # Two passes: (1) fast, sequential eligibility checks (pure in-memory lookups,
+    # negligible latency) to build the list of triggers actually worth composing for,
+    # then (2) run the slow part -- compose(), which can make real LLM calls -- for
+    # ALL eligible triggers CONCURRENTLY rather than one at a time. With up to 5+
+    # triggers per tick and compose() now able to make 2 sequential LLM calls each
+    # (initial + retry-on-fabrication), sequential processing could blow past the
+    # judge's 30s-per-call budget even at Groq's speed. Concurrency bounds total
+    # latency to roughly the slowest single trigger, not the sum of all of them.
+    eligible = []  # list of (trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer)
 
     for trg_id in body.available_triggers:
         trg = _get_trigger(trg_id)
@@ -231,63 +240,83 @@ def tick(body: TickBody):
 
         customer = _get_customer(customer_id) if customer_id else None
 
-        try:
-            result = compose(category, merchant, trg, customer)
-        except Exception as e:
-            print(f"[TICK] Compose error for {trg_id}: {e}")
-            continue
-
-        body_text = result.get("body", "").strip()
-        if not body_text:
-            continue
-
-        kind = trg.get("kind", "generic")
-        owner = merchant.get("identity", {}).get("owner_first_name", "")
-        mname = merchant.get("identity", {}).get("name", "")
-        send_as = result.get("send_as", "vera")
-        if customer_id:
-            send_as = "merchant_on_behalf"
-
-        # No hard body-length cap per spec (testing-brief F.3) — compose() already
-        # applies a generous sanity ceiling. Just re-run the URL guard defensively.
-        body_text = strip_urls(body_text)
-        if not body_text:
-            continue
-        action_entry = {
-            "conversation_id": conv_id,
-            "merchant_id": merchant_id,
-            "send_as": send_as,
-            "trigger_id": trg_id,
-            "template_name": f"vera_{kind}_v1",
-            "template_params": [owner or mname, body_text[:80], ""],
-            "body": body_text,
-            "cta": result.get("cta", "open_ended"),
-            "suppression_key": result.get("suppression_key", sup_key),
-            "rationale": result.get("rationale", ""),
-        }
-        if customer_id:
-            action_entry["customer_id"] = customer_id
-        actions.append(action_entry)
-
-        _payload = trg.get("payload", {})
-        _slots_raw = _payload.get("available_slots") or _payload.get("next_session_options") or []
-        conversations[conv_id] = {
-            "slots": [s.get("label", str(s)) if isinstance(s, dict) else str(s) for s in _slots_raw],
-            "turns": [{"from": "bot", "msg": body_text}],
-            "merchant_id": merchant_id,
-            "customer_id": customer_id,
-            "trigger_id": trg_id,
-            "trigger_kind": kind,
-            "ended": False,
-            "turn_number": 1,
-            "auto_reply_count": 0,
-        }
-
-        if sup_key:
-            sent_suppression_keys.add(sup_key)
-
-        if len(actions) >= 20:
+        eligible.append((trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer))
+        if len(eligible) >= 20:
             break
+
+    def _compose_job(job):
+        trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer = job
+        try:
+            return job, compose(category, merchant, trg, customer), None
+        except Exception as e:
+            return job, None, e
+
+    actions = []
+    if eligible:
+        with ThreadPoolExecutor(max_workers=min(len(eligible), 8)) as pool:
+            futures = [pool.submit(_compose_job, job) for job in eligible]
+            for fut in futures:
+                job, result, err = fut.result()
+                trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer = job
+
+                if err is not None:
+                    print(f"[TICK] Compose error for {trg_id}: {err}")
+                    continue
+                if result is None:
+                    continue
+
+                body_text = result.get("body", "").strip()
+                if not body_text:
+                    continue
+
+                kind = trg.get("kind", "generic")
+                owner = merchant.get("identity", {}).get("owner_first_name", "")
+                mname = merchant.get("identity", {}).get("name", "")
+                send_as = result.get("send_as", "vera")
+                if customer_id:
+                    send_as = "merchant_on_behalf"
+
+                # No hard body-length cap per spec (testing-brief F.3) — compose()
+                # already applies a generous sanity ceiling. Re-run the URL guard defensively.
+                body_text = strip_urls(body_text)
+                if not body_text:
+                    continue
+
+                action_entry = {
+                    "conversation_id": conv_id,
+                    "merchant_id": merchant_id,
+                    "send_as": send_as,
+                    "trigger_id": trg_id,
+                    "template_name": f"vera_{kind}_v1",
+                    "template_params": [owner or mname, body_text[:80], ""],
+                    "body": body_text,
+                    "cta": result.get("cta", "open_ended"),
+                    "suppression_key": result.get("suppression_key", sup_key),
+                    "rationale": result.get("rationale", ""),
+                }
+                if customer_id:
+                    action_entry["customer_id"] = customer_id
+                actions.append(action_entry)
+
+                _payload = trg.get("payload", {})
+                _slots_raw = _payload.get("available_slots") or _payload.get("next_session_options") or []
+                conversations[conv_id] = {
+                    "slots": [s.get("label", str(s)) if isinstance(s, dict) else str(s) for s in _slots_raw],
+                    "turns": [{"from": "bot", "msg": body_text}],
+                    "merchant_id": merchant_id,
+                    "customer_id": customer_id,
+                    "trigger_id": trg_id,
+                    "trigger_kind": kind,
+                    "ended": False,
+                    "turn_number": 1,
+                    "auto_reply_count": 0,
+                }
+
+                if sup_key:
+                    sent_suppression_keys.add(sup_key)
+
+                if len(actions) >= 20:
+                    break
 
     _save_state()
     return {"actions": actions}
