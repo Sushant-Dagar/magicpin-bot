@@ -381,30 +381,56 @@ def _has_fabricated_citation(body: str, context_blob: str) -> Optional[str]:
     return None
 
 
+_NEW_ADDITION_RE = re.compile(
+    r"(?:we'?ve added|we'?ve introduced|since then we'?ve|we now (?:have|offer)|"
+    r"new (?:class|service|instructor|trainer|program|batch|session)es?|"
+    r"introduced a new|hum ne|naya(?:\s+\w+)?\s+shuru)"
+    r"\s+((?:(?!\bplease\b|\breply\b|\band\b\s)[\w'/,]+\s*){1,8})",
+    re.IGNORECASE,
+)
+_STOPWORDS = {"a", "an", "the", "new", "we", "you", "your", "for", "to", "and", "at",
+              "with", "plus", "led", "by", "class", "classes", "service", "services",
+              "of", "our", "is", "are", "this", "that", "perfect", "still", "certified"}
+
 def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict, is_customer_facing: bool) -> Optional[str]:
-    """For customer-facing messages: flag if the body presents a category-catalog offer/class
-    as something THIS merchant has, when it isn't in the merchant's own active offers.
-    (Real observed failure: a gym message told a customer 'you'll love our new Free Body
-    Composition Analysis' -- that title exists only in the category's generic offer_catalog,
-    never in this merchant's own offers. Earlier version of this check required specific
-    trigger phrases like "we've added" before looking -- too narrow, the LLM rephrases
-    freely. Now checks directly: any category-only catalog item's title appearing in a
-    customer-facing body is flagged, regardless of the surrounding wording.)"""
+    """For customer-facing messages: flag any claim that the merchant added/introduced
+    something new, unless that specific thing is verifiable in the merchant's OWN data
+    (offers, signals, conversation history) -- not just the category-wide catalog/vocab.
+    Two real observed failures this guards against: a category-catalog item ('Free Body
+    Composition Analysis') presented as merchant-confirmed, and a fully free-form
+    invention ('a weekly yoga class led by certified instructors') that matched no
+    catalog item at all but was still never in this merchant's own data."""
     if not is_customer_facing:
         return None
-    active_offer_titles = " ".join(
-        o.get("title", "") for o in merchant.get("offers", []) if o.get("status") == "active"
-    ).lower()
     norm = lambda s: re.sub(r"[-–—]", " ", s).lower()
     body_norm = norm(body)
-    active_offer_titles = norm(active_offer_titles)
+
+    merchant_own_blob = norm(" ".join([
+        json.dumps(merchant.get("offers", []), ensure_ascii=False),
+        json.dumps(merchant.get("signals", []), ensure_ascii=False),
+        json.dumps(merchant.get("conversation_history", []), ensure_ascii=False),
+        json.dumps(merchant.get("review_themes", []), ensure_ascii=False),
+    ]))
+
+    # 1. Exact category-catalog item presented as merchant's own (narrow, high-confidence)
+    active_offer_titles = norm(" ".join(
+        o.get("title", "") for o in merchant.get("offers", []) if o.get("status") == "active"
+    ))
     for item in category.get("offer_catalog", []):
-        title = item.get("title", "")
-        title_key = norm(re.sub(r"@.*|₹.*", "", title).strip())
-        if len(title_key) < 6:
+        title_key = norm(re.sub(r"@.*|₹.*", "", item.get("title", "")).strip())
+        if len(title_key) >= 6 and title_key in body_norm and title_key not in active_offer_titles:
+            return item.get("title")
+
+    # 2. General "we added/introduced something new" pattern, checked against the
+    # merchant's OWN data only (broader net, catches free-form inventions too)
+    for match in _NEW_ADDITION_RE.finditer(body):
+        noun_phrase = match.group(1)
+        tokens = [t.lower() for t in re.findall(r"[A-Za-z]+", noun_phrase)
+                  if t.lower() not in _STOPWORDS and len(t) > 2]
+        if not tokens:
             continue
-        if title_key in body_norm and title_key not in active_offer_titles:
-            return title
+        if not any(t in merchant_own_blob for t in tokens):
+            return match.group(0).strip()
     return None
 
 
