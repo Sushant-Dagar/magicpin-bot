@@ -162,7 +162,7 @@ def metadata():
             "customer-facing slot booking. Adaptive to context version updates; deterministic "
             "fallback composer with real payload-derived facts when the LLM is unavailable."
         ),
-        "contact_email": os.getenv("TEAM_EMAIL", "email2sushantdagar@gmail.com"),,
+        "contact_email": os.getenv("TEAM_EMAIL", "email2sushantdagar@gmail.com"),
         "version": "2.0.0",
         "submitted_at": _now_iso(),
     }
