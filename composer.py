@@ -384,25 +384,24 @@ def _has_fabricated_citation(body: str, context_blob: str) -> Optional[str]:
 def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict, is_customer_facing: bool) -> Optional[str]:
     """For customer-facing messages: flag if the body presents a category-catalog offer/class
     as something THIS merchant has, when it isn't in the merchant's own active offers.
-    (Real observed failure: a gym message told a customer 'we've added a new HIIT class' --
-    HIIT was only in the category's generic vocab_allowed list, not this merchant's own data.)"""
+    (Real observed failure: a gym message told a customer 'you'll love our new Free Body
+    Composition Analysis' -- that title exists only in the category's generic offer_catalog,
+    never in this merchant's own offers. Earlier version of this check required specific
+    trigger phrases like "we've added" before looking -- too narrow, the LLM rephrases
+    freely. Now checks directly: any category-only catalog item's title appearing in a
+    customer-facing body is flagged, regardless of the surrounding wording.)"""
     if not is_customer_facing:
         return None
     active_offer_titles = " ".join(
         o.get("title", "") for o in merchant.get("offers", []) if o.get("status") == "active"
     ).lower()
-    # Normalize hyphens/dashes to spaces so "body-composition" matches catalog's "body composition"
     norm = lambda s: re.sub(r"[-–—]", " ", s).lower()
     body_norm = norm(body)
     active_offer_titles = norm(active_offer_titles)
-    claim_markers = ["we've added", "we now offer", "we've introduced", "new class",
-                      "hum ab", "naya class"]
-    if not any(m in body_norm for m in claim_markers):
-        return None
     for item in category.get("offer_catalog", []):
         title = item.get("title", "")
         title_key = norm(re.sub(r"@.*|₹.*", "", title).strip())
-        if len(title_key) < 4:
+        if len(title_key) < 6:
             continue
         if title_key in body_norm and title_key not in active_offer_titles:
             return title
