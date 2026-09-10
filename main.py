@@ -151,7 +151,7 @@ def metadata():
     return {
         "team_name": os.getenv("TEAM_NAME", "Sushant Dagar"),
         "team_members": [os.getenv("TEAM_MEMBER_1", "Sushant Dagar")],
-        "model": os.getenv("LLM_MODEL", "llama-3.3-70b-versatile"),
+        "model": os.getenv("LLM_MODEL", "openai/gpt-oss-120b"),
         "approach": (
             "4-context LLM composer (category+merchant+trigger+customer) with per-trigger-kind "
             "prompt dispatch, no hard body-length cap, hard URL guard, and a checklist-driven "

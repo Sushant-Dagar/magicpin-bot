@@ -43,7 +43,7 @@ def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
             base_url="https://api.groq.com/openai/v1",
             timeout=LLM_TIMEOUT_SECONDS,
         )
-        model = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+        model = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
         # Groq doesn't support response_format=json_object for all models,
         # so we ask for JSON in the prompt and parse manually.
         resp = client.chat.completions.create(
