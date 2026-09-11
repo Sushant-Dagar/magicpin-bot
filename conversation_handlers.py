@@ -31,6 +31,12 @@ AUTO_REPLY_PATTERNS = [
 ]
 
 HOSTILE_PATTERNS = [
+    r"^\s*(please\s+|pls\s+)?stop\s*[.!]?\s*$",  # bare "STOP" (with optional
+    # "please"/"pls" prefix and trailing punctuation) -- the universal WhatsApp/SMS
+    # opt-out keyword, explicitly and separately tested by the real harness
+    # ("STOP / Hostile Handling"). Must be checked as a standalone message, not just
+    # "stop messaging" etc below -- and NOT match "stopping by later" or "nonstop
+    # service", which the anchored ^...$ pattern correctly avoids.
     r"\bstop\b.*\bmessag",
     r"\bstop (messaging|sending|contacting)\b",
     r"not interested",
@@ -38,6 +44,7 @@ HOSTILE_PATTERNS = [
     r"remove (me|my number)",
     r"don'?t (message|contact|bother|call) (me|us)",
     r"\bblock\b",
+    r"\bunsubscribe\b",
     r"band karo",
     r"mat bhejo",
     r"mujhe nahi chahiye",
@@ -71,17 +78,17 @@ INTENT_POSITIVE_PATTERNS = [
 
 
 def is_auto_reply(message: str) -> bool:
-    msg = message.lower().strip()
+    msg = (message or "").lower().strip()
     return any(re.search(p, msg) for p in AUTO_REPLY_PATTERNS)
 
 
 def is_hostile(message: str) -> bool:
-    msg = message.lower().strip()
+    msg = (message or "").lower().strip()
     return any(re.search(p, msg) for p in HOSTILE_PATTERNS)
 
 
 def is_positive_intent(message: str) -> bool:
-    msg = message.lower().strip()
+    msg = (message or "").lower().strip()
     return any(re.search(p, msg) for p in INTENT_POSITIVE_PATTERNS)
 
 
@@ -332,7 +339,7 @@ def _classify_situation(message: str, state: dict) -> str:
             "Switch to action mode immediately. Do NOT ask qualifying questions. "
             "Deliver the artifact or next concrete step."
         )
-    msg_lower = message.lower()
+    msg_lower = (message or "").lower()
     off_topic_signals = ["gst", "tax", "legal", "police", "government", "loan", "bank", "insurance"]
     if any(s in msg_lower for s in off_topic_signals):
         return (
