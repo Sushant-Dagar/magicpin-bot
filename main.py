@@ -253,7 +253,15 @@ def tick(body: TickBody):
 
     actions = []
     if eligible:
-        with ThreadPoolExecutor(max_workers=min(len(eligible), 8)) as pool:
+        # Free-tier hosts (Render free, etc.) have very limited RAM/CPU. A high thread
+        # count here -- each holding its own LLM connection open -- can spike memory
+        # enough to get the whole container killed and restarted (observed in testing:
+        # /v1/healthz itself started timing out, and uptime_seconds reset to near-zero,
+        # meaning the process had crashed and Render restarted it). 3 is gentle enough
+        # to stay stable on constrained hosts while still meaningfully beating fully
+        # sequential processing.
+        max_workers = int(os.getenv("TICK_MAX_WORKERS", "3"))
+        with ThreadPoolExecutor(max_workers=min(len(eligible), max_workers)) as pool:
             futures = [pool.submit(_compose_job, job) for job in eligible]
             for fut in futures:
                 job, result, err = fut.result()

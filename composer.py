@@ -19,16 +19,44 @@ from typing import Optional
 # fit comfortably under 30s including all other tick-handler overhead.
 LLM_TIMEOUT_SECONDS = float(os.getenv("LLM_TIMEOUT_SECONDS", "10"))
 
+# Reuse one client per provider instead of constructing a new one (with its own
+# connection pool) on every single call. On a memory-constrained free-tier host,
+# creating a fresh client per call under concurrent load was a real contributor to
+# memory pressure severe enough to crash the whole process (observed: /v1/healthz
+# itself started timing out and the service's uptime reset, meaning it had been
+# killed and restarted by the host).
+_client_cache: dict = {}
+
+def _get_client(provider: str):
+    if provider in _client_cache:
+        return _client_cache[provider]
+    if provider == "anthropic":
+        import anthropic
+        client = anthropic.Anthropic(
+            api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS
+        )
+    elif provider == "groq":
+        from openai import OpenAI
+        api_key = os.getenv("GROQ_API_KEY", "")
+        if not api_key:
+            raise ValueError("GROQ_API_KEY not set in environment / .env file")
+        client = OpenAI(
+            api_key=api_key, base_url="https://api.groq.com/openai/v1",
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+    else:
+        from openai import OpenAI
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS)
+    _client_cache[provider] = client
+    return client
+
 
 # LLM client (supports OpenAI + Anthropic + Groq)
 def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
 
     if provider == "anthropic":
-        import anthropic
-        client = anthropic.Anthropic(
-            api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS
-        )
+        client = _get_client(provider)
         model = os.getenv("LLM_MODEL", "claude-3-5-sonnet-20241022")
         resp = client.messages.create(
             model=model, max_tokens=1024,
@@ -38,15 +66,7 @@ def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
         return resp.content[0].text
 
     elif provider == "groq":
-        from openai import OpenAI
-        api_key = os.getenv("GROQ_API_KEY", "")
-        if not api_key:
-            raise ValueError("GROQ_API_KEY not set in environment / .env file")
-        client = OpenAI(
-            api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",
-            timeout=LLM_TIMEOUT_SECONDS,
-        )
+        client = _get_client(provider)
         model = os.getenv("LLM_MODEL", "openai/gpt-oss-120b")
         # Groq doesn't support response_format=json_object for all models,
         # so we ask for JSON in the prompt and parse manually.
@@ -60,8 +80,7 @@ def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
         return resp.choices[0].message.content
 
     else:  # default openai
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS)
+        client = _get_client(provider)
         model = os.getenv("LLM_MODEL", "gpt-4o")
         resp = client.chat.completions.create(
             model=model, temperature=temperature,
