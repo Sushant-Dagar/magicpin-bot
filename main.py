@@ -5,9 +5,10 @@ FastAPI server exposing all 5 required endpoints.
 from __future__ import annotations
 import os
 import time
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait as futures_wait
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -44,6 +45,23 @@ sent_suppression_keys: set = set()
 # merchants who went hostile — no further proactive sends to them at all
 # (phase-4 spec: "suppressing all future triggers for this merchant")
 hostile_merchants: set = set()
+
+# Global cap on concurrent LLM calls across ALL in-flight /v1/tick and /v1/reply requests
+# combined -- not per-request. Observed failure mode: the judge's client-side timeout
+# fires and it sends a NEW tick request while the OLD one is still running server-side;
+# each request's own thread pool then stacks on top of the others, and on a
+# resource-constrained free-tier host this pile-up starves every thread of CPU time
+# badly enough that even a 10s per-call network timeout takes 20-30s of wall-clock time
+# to actually fire. A process-wide semaphore bounds total concurrent LLM work regardless
+# of how many HTTP requests are simultaneously in flight.
+GLOBAL_LLM_CONCURRENCY = int(os.getenv("GLOBAL_LLM_CONCURRENCY", "3"))
+_llm_semaphore = threading.Semaphore(GLOBAL_LLM_CONCURRENCY)
+
+# Hard wall-clock budget for the whole /v1/tick handler. The judge's spec budget is 30s;
+# stay well under it so there's time to serialize/return. If this deadline is hit before
+# all eligible triggers have composed, return whatever completed in time rather than
+# blocking further -- partial results beat a request that never returns at all.
+TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "22"))
 
 STATE_FILE = _Path(os.getenv("STATE_FILE", "bot_state.json"))
 
@@ -251,14 +269,22 @@ def tick(body: TickBody):
     def _compose_job(job):
         trg_id = job[0]
         _jt0 = time.time()
-        print(f"[TICK]   job {trg_id} starting compose()")
+        # Global semaphore, not per-tick-call: caps TOTAL concurrent LLM work across
+        # every in-flight request on this process, preventing the pile-up described above.
+        acquired = _llm_semaphore.acquire(timeout=max(0.1, TICK_DEADLINE_SECONDS - (time.time() - _t0)))
+        if not acquired:
+            print(f"[TICK]   job {trg_id} could not acquire LLM slot in time, skipping")
+            return job, None, TimeoutError("global LLM concurrency slot unavailable in time")
         try:
+            print(f"[TICK]   job {trg_id} starting compose() (waited {time.time()-_jt0:.2f}s for slot)")
             r = compose(job[6], job[7], job[5], job[8], allow_retry=False)
-            print(f"[TICK]   job {trg_id} compose() done in {time.time()-_jt0:.2f}s")
+            print(f"[TICK]   job {trg_id} compose() done in {time.time()-_jt0:.2f}s total")
             return job, r, None
         except Exception as e:
             print(f"[TICK]   job {trg_id} compose() FAILED after {time.time()-_jt0:.2f}s: {e}")
             return job, None, e
+        finally:
+            _llm_semaphore.release()
 
     actions = []
     if eligible:
@@ -268,12 +294,27 @@ def tick(body: TickBody):
         # /v1/healthz itself started timing out, and uptime_seconds reset to near-zero,
         # meaning the process had crashed and Render restarted it). 3 is gentle enough
         # to stay stable on constrained hosts while still meaningfully beating fully
-        # sequential processing.
+        # sequential processing. The real concurrency cap is the global semaphore above;
+        # this pool size just bounds how many jobs from THIS call queue up waiting for it.
         max_workers = int(os.getenv("TICK_MAX_WORKERS", "3"))
         print(f"[TICK] launching thread pool, max_workers={min(len(eligible), max_workers)}, at +{time.time()-_t0:.2f}s")
-        with ThreadPoolExecutor(max_workers=min(len(eligible), max_workers)) as pool:
+        # NOT using `with ThreadPoolExecutor(...) as pool:` deliberately -- its __exit__
+        # calls shutdown(wait=True), which blocks until every submitted job finishes
+        # regardless of our deadline below, defeating the whole point of the deadline.
+        pool = ThreadPoolExecutor(max_workers=min(len(eligible), max_workers))
+        try:
             futures = [pool.submit(_compose_job, job) for job in eligible]
-            for fut in futures:
+
+            # Hard deadline: don't block past the budget waiting for stragglers. Whatever
+            # hasn't completed by then is simply not included -- better than a request
+            # that never returns and gets abandoned by the client (which is exactly what
+            # was compounding the pile-up).
+            remaining = max(0.1, TICK_DEADLINE_SECONDS - (time.time() - _t0))
+            done, not_done = futures_wait(futures, timeout=remaining)
+            if not_done:
+                print(f"[TICK] deadline hit at +{time.time()-_t0:.2f}s, {len(not_done)} job(s) still running -- returning partial results")
+
+            for fut in done:
                 job, result, err = fut.result()
                 trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer = job
                 print(f"[TICK]   collected result for {trg_id} at +{time.time()-_t0:.2f}s")
@@ -336,6 +377,12 @@ def tick(body: TickBody):
 
                 if len(actions) >= 20:
                     break
+        finally:
+            # wait=False: don't block here either. Any not_done jobs keep running in the
+            # background and will release their semaphore slot / update nothing shared
+            # once they finish (they were never added to `actions`/`conversations` since
+            # we only iterated `done` above) -- effectively just wasted work, not a hang.
+            pool.shutdown(wait=False)
 
     print(f"[TICK] all jobs collected at +{time.time()-_t0:.2f}s, calling _save_state()")
     _save_state()
@@ -400,7 +447,17 @@ def reply(body: ReplyBody):
 
     # Pass conv directly — mutations inside respond() persist (e.g. ended flag)
     conv["customer_id"] = resolved_customer_id
-    result = respond(conv, merchant_message, merchant=merchant, category=category)
+    # Same global semaphore as /v1/tick -- a concurrent tick batch and a reply call
+    # shouldn't be able to independently stack extra LLM load on top of each other.
+    _reply_t0 = time.time()
+    if _llm_semaphore.acquire(timeout=max(0.1, 25 - (time.time() - _reply_t0))):
+        try:
+            result = respond(conv, merchant_message, merchant=merchant, category=category)
+        finally:
+            _llm_semaphore.release()
+    else:
+        result = {"action": "wait", "wait_seconds": 30,
+                  "rationale": "LLM capacity busy with other in-flight requests; backing off briefly."}
 
     action = result.get("action", "send")
     if action == "send":
