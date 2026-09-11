@@ -218,8 +218,14 @@ KIND_GUIDANCE = {
         "in THIS merchant's roster it applies to. End with a low-friction offer to draft/pull content for them."
     ),
     "regulation_change": (
-        "Lead with the regulatory deadline and what changes. Tell them EXACTLY what action they need to take "
-        "before the deadline. Use urgency — compliance failure has real consequences."
+        "Lead with the EXACT regulatory change from the digest item's summary -- the specific "
+        "numbers/thresholds/before-vs-after given (e.g. dose limits, equipment categories affected "
+        "vs unaffected). Cite the source (e.g. 'Dental Council of India circular 2026-11-04'). Use "
+        "ONLY the action from the digest item's 'actionable' field as the required next step -- "
+        "never invent a compliance process (uploads, certifications, portals) or a consequence "
+        "(fines, suspension, penalties) that isn't literally stated in the context. If no "
+        "consequence is given, don't invent one -- the deadline and the real numbers are urgent "
+        "enough on their own."
     ),
     "cde_opportunity": (
         "Lead with the CDE credit count and cost. Who is the speaker or topic? What's the tangible value "
@@ -486,6 +492,26 @@ def _has_unconfirmed_merchant_service(body: str, category: dict, merchant: dict,
     return None
 
 
+_INVENTED_CONSEQUENCE_RE = re.compile(
+    r"\b(fine[sd]?|penalty|penalties|suspension|suspend(?:ed)?|blacklist(?:ed)?|"
+    r"delisted|deactivat(?:ed|ion)|legal action|prosecut\w*)\b", re.IGNORECASE
+)
+
+def _has_invented_consequence(body: str, trigger_kind: str, context_blob: str) -> Optional[str]:
+    """Compliance/regulation messages are the one place we observed the LLM invent a
+    specific penalty ('fines or suspension of your listing') that appeared nowhere in the
+    actual digest item -- the context only ever gives a deadline and a technical change,
+    never a stated consequence. Only checked for regulation/compliance-type triggers,
+    where an invented threat is both easy for the model to reach for and easy to verify
+    against context (the real digest items in this dataset never state a penalty)."""
+    if trigger_kind not in ("regulation_change", "supply_alert"):
+        return None
+    match = _INVENTED_CONSEQUENCE_RE.search(body)
+    if match and match.group().lower() not in context_blob:
+        return match.group()
+    return None
+
+
 def compose(
     category: dict,
     merchant: dict,
@@ -636,17 +662,20 @@ def compose(
     # Only fall back to the mechanical version if the retry ALSO fails the check.
     blob = _context_blob(category, merchant, trigger, customer)
 
+    trigger_kind_for_check = trigger.get("kind", "")
+
     def _check(body: str) -> tuple:
         bad_citation = _has_fabricated_citation(body, blob)
         bad_service = _has_unconfirmed_merchant_service(
             body, category, merchant, is_customer_facing=bool(customer)
         )
-        return bad_citation, bad_service
+        bad_consequence = _has_invented_consequence(body, trigger_kind_for_check, blob)
+        return bad_citation, bad_service, bad_consequence
 
-    bad_citation, bad_service = _check(result["body"])
+    bad_citation, bad_service, bad_consequence = _check(result["body"])
 
-    if bad_citation or bad_service:
-        offending = bad_citation or bad_service
+    if bad_citation or bad_service or bad_consequence:
+        offending = bad_citation or bad_service or bad_consequence
 
         if allow_retry:
             retry_instruction = (
@@ -654,7 +683,7 @@ def compose(
                 "It does not appear anywhere in the context provided above. Rewrite the "
                 "message using ONLY facts, offers, and services that are literally present "
                 "in the category/merchant/trigger/customer context given. Do not invent any "
-                "new class, service, instructor, or citation. Return JSON only."
+                "new class, service, instructor, citation, or consequence/penalty. Return JSON only."
             )
             retry_result, retry_err = _try_llm_compose(retry_instruction)
             if retry_result is not None:
@@ -665,8 +694,8 @@ def compose(
                 elif not retry_result.get("send_as"):
                     retry_result["send_as"] = "vera"
                 retry_result["body"] = strip_urls(smart_trim(retry_result.get("body", "")))
-                retry_bad_citation, retry_bad_service = _check(retry_result["body"])
-                if not (retry_bad_citation or retry_bad_service) and retry_result["body"].strip():
+                retry_bad_citation, retry_bad_service, retry_bad_consequence = _check(retry_result["body"])
+                if not (retry_bad_citation or retry_bad_service or retry_bad_consequence) and retry_result["body"].strip():
                     retry_result["rationale"] = (
                         retry_result.get("rationale", "")
                         + f" [Retried after first attempt was rejected for: '{offending}']"
@@ -681,10 +710,12 @@ def compose(
 
         # Retry either disabled, failed outright, or still fabricated -- use the safe fallback.
         fallback = _fallback_compose(category, merchant, trigger, customer)
-        reason = (
-            f"unverifiable citation '{bad_citation}'" if bad_citation
-            else f"claimed unconfirmed merchant service '{bad_service}' (only in category catalog, not merchant's own active offers)"
-        )
+        if bad_citation:
+            reason = f"unverifiable citation '{bad_citation}'"
+        elif bad_service:
+            reason = f"claimed unconfirmed merchant service '{bad_service}' (only in category catalog, not merchant's own active offers)"
+        else:
+            reason = f"invented consequence/penalty '{bad_consequence}' not stated in context"
         fallback["rationale"] += (
             f" [LLM output rejected: {reason}, not traceable to pushed context{retry_note}]"
         )
