@@ -198,6 +198,8 @@ def push_context(body: ContextBody):
 
 @app.post("/v1/tick")
 def tick(body: TickBody):
+    _t0 = time.time()
+    print(f"[TICK] start, {len(body.available_triggers)} triggers requested: {body.available_triggers}")
     # Two passes: (1) fast, sequential eligibility checks (pure in-memory lookups,
     # negligible latency) to build the list of triggers actually worth composing for,
     # then (2) run the slow part -- compose(), which can make real LLM calls -- for
@@ -244,11 +246,18 @@ def tick(body: TickBody):
         if len(eligible) >= 20:
             break
 
+    print(f"[TICK] eligibility pass done at +{time.time()-_t0:.2f}s, {len(eligible)} eligible: {[e[0] for e in eligible]}")
+
     def _compose_job(job):
-        trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer = job
+        trg_id = job[0]
+        _jt0 = time.time()
+        print(f"[TICK]   job {trg_id} starting compose()")
         try:
-            return job, compose(category, merchant, trg, customer, allow_retry=False), None
+            r = compose(job[6], job[7], job[5], job[8], allow_retry=False)
+            print(f"[TICK]   job {trg_id} compose() done in {time.time()-_jt0:.2f}s")
+            return job, r, None
         except Exception as e:
+            print(f"[TICK]   job {trg_id} compose() FAILED after {time.time()-_jt0:.2f}s: {e}")
             return job, None, e
 
     actions = []
@@ -261,11 +270,13 @@ def tick(body: TickBody):
         # to stay stable on constrained hosts while still meaningfully beating fully
         # sequential processing.
         max_workers = int(os.getenv("TICK_MAX_WORKERS", "3"))
+        print(f"[TICK] launching thread pool, max_workers={min(len(eligible), max_workers)}, at +{time.time()-_t0:.2f}s")
         with ThreadPoolExecutor(max_workers=min(len(eligible), max_workers)) as pool:
             futures = [pool.submit(_compose_job, job) for job in eligible]
             for fut in futures:
                 job, result, err = fut.result()
                 trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer = job
+                print(f"[TICK]   collected result for {trg_id} at +{time.time()-_t0:.2f}s")
 
                 if err is not None:
                     print(f"[TICK] Compose error for {trg_id}: {err}")
@@ -326,7 +337,9 @@ def tick(body: TickBody):
                 if len(actions) >= 20:
                     break
 
+    print(f"[TICK] all jobs collected at +{time.time()-_t0:.2f}s, calling _save_state()")
     _save_state()
+    print(f"[TICK] done, returning {len(actions)} actions at +{time.time()-_t0:.2f}s total")
     return {"actions": actions}
 
 
