@@ -247,7 +247,7 @@ def tick(body: TickBody):
     def _compose_job(job):
         trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer = job
         try:
-            return job, compose(category, merchant, trg, customer), None
+            return job, compose(category, merchant, trg, customer, allow_retry=False), None
         except Exception as e:
             return job, None, e
 

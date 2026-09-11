@@ -475,10 +475,20 @@ def compose(
     merchant: dict,
     trigger: dict,
     customer: Optional[dict] = None,
+    allow_retry: bool = True,
 ) -> dict:
     """
     Main composition entry point.
     Returns dict with keys: body, cta, send_as, suppression_key, rationale
+
+    allow_retry: if a fabrication is caught, whether to give the LLM one corrected
+    attempt (better quality) or fall straight to the safe deterministic fallback
+    (bounded to exactly 1 LLM call, much lower worst-case latency). /v1/tick processes
+    multiple triggers per call under a hard wall-clock budget -- with a reasoning model
+    (visible "reasoning" tokens generated before every answer), two sequential calls per
+    trigger multiplied across several triggers can blow the budget even with concurrency.
+    main.py passes allow_retry=False for tick; the retry path stays available for
+    lower-volume/single-message use.
     """
     slug = category.get("slug", "unknown")
     voice = category.get("voice", {})
@@ -607,39 +617,46 @@ def compose(
 
     if bad_citation or bad_service:
         offending = bad_citation or bad_service
-        retry_instruction = (
-            f"Your previous attempt included this unverifiable claim: \"{offending}\". "
-            "It does not appear anywhere in the context provided above. Rewrite the "
-            "message using ONLY facts, offers, and services that are literally present "
-            "in the category/merchant/trigger/customer context given. Do not invent any "
-            "new class, service, instructor, or citation. Return JSON only."
-        )
-        retry_result, retry_err = _try_llm_compose(retry_instruction)
-        if retry_result is not None:
-            if not retry_result.get("suppression_key"):
-                retry_result["suppression_key"] = result["suppression_key"]
-            if customer and not retry_result.get("send_as"):
-                retry_result["send_as"] = "merchant_on_behalf"
-            elif not retry_result.get("send_as"):
-                retry_result["send_as"] = "vera"
-            retry_result["body"] = strip_urls(smart_trim(retry_result.get("body", "")))
-            retry_bad_citation, retry_bad_service = _check(retry_result["body"])
-            if not (retry_bad_citation or retry_bad_service) and retry_result["body"].strip():
-                retry_result["rationale"] = (
-                    retry_result.get("rationale", "")
-                    + f" [Retried after first attempt was rejected for: '{offending}']"
-                )
-                return retry_result
 
-        # Retry either failed outright or still fabricated -- use the safe fallback.
+        if allow_retry:
+            retry_instruction = (
+                f"Your previous attempt included this unverifiable claim: \"{offending}\". "
+                "It does not appear anywhere in the context provided above. Rewrite the "
+                "message using ONLY facts, offers, and services that are literally present "
+                "in the category/merchant/trigger/customer context given. Do not invent any "
+                "new class, service, instructor, or citation. Return JSON only."
+            )
+            retry_result, retry_err = _try_llm_compose(retry_instruction)
+            if retry_result is not None:
+                if not retry_result.get("suppression_key"):
+                    retry_result["suppression_key"] = result["suppression_key"]
+                if customer and not retry_result.get("send_as"):
+                    retry_result["send_as"] = "merchant_on_behalf"
+                elif not retry_result.get("send_as"):
+                    retry_result["send_as"] = "vera"
+                retry_result["body"] = strip_urls(smart_trim(retry_result.get("body", "")))
+                retry_bad_citation, retry_bad_service = _check(retry_result["body"])
+                if not (retry_bad_citation or retry_bad_service) and retry_result["body"].strip():
+                    retry_result["rationale"] = (
+                        retry_result.get("rationale", "")
+                        + f" [Retried after first attempt was rejected for: '{offending}']"
+                    )
+                    return retry_result
+            retry_note = f"; retry error: {retry_err}" if retry_err else "; retry still fabricated"
+        else:
+            # Retry disabled (e.g. from /v1/tick, where a second sequential LLM call per
+            # trigger risks blowing the batch's wall-clock budget) -- go straight to the
+            # safe, bounded-to-one-call fallback.
+            retry_note = "; retry disabled for this call path (latency budget)"
+
+        # Retry either disabled, failed outright, or still fabricated -- use the safe fallback.
         fallback = _fallback_compose(category, merchant, trigger, customer)
         reason = (
             f"unverifiable citation '{bad_citation}'" if bad_citation
             else f"claimed unconfirmed merchant service '{bad_service}' (only in category catalog, not merchant's own active offers)"
         )
-        retry_note = f"; retry error: {retry_err}" if retry_err else "; retry still fabricated"
         fallback["rationale"] += (
-            f" [LLM output rejected twice: {reason}, not traceable to pushed context{retry_note}]"
+            f" [LLM output rejected: {reason}, not traceable to pushed context{retry_note}]"
         )
         return fallback
 
