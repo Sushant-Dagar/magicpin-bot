@@ -33,7 +33,11 @@ def _get_client(provider: str):
     if provider == "anthropic":
         import anthropic
         client = anthropic.Anthropic(
-            api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS
+            api_key=os.getenv("ANTHROPIC_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,  # SDK default is 2 automatic retries -- each with its own
+            # full timeout, silently turning a "10s" budget into ~30s. Disabled: our own
+            # fallback logic already handles failures; we don't need the SDK retrying
+            # underneath us and blowing the tick deadline as a result.
         )
     elif provider == "groq":
         from openai import OpenAI
@@ -43,10 +47,13 @@ def _get_client(provider: str):
         client = OpenAI(
             api_key=api_key, base_url="https://api.groq.com/openai/v1",
             timeout=LLM_TIMEOUT_SECONDS,
+            max_retries=0,  # same reasoning as above -- this was very likely the real
+            # cause of compose() calls observed taking 20-37s despite a 10s timeout.
         )
     else:
         from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS)
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY", ""), timeout=LLM_TIMEOUT_SECONDS,
+                         max_retries=0)
     _client_cache[provider] = client
     return client
 
