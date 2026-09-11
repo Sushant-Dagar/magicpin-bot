@@ -8,7 +8,41 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Optional
+
+import threading
+from collections import deque
+
+# --- Token-budget guard -----------------------------------------------------
+# Groq's free tier for openai/gpt-oss-120b is 8,000 tokens/minute (confirmed from the
+# account's own dashboard) -- a hard ceiling no amount of concurrency/retry tuning can
+# get around. Rather than fire a call that's very likely to 429 and waste the attempt,
+# track a rolling 60s window of estimated token usage and skip straight to the safe
+# deterministic fallback when the budget for this window is already spent.
+TPM_BUDGET = int(os.getenv("LLM_TPM_BUDGET", "7000"))  # a little under the real 8000 as margin
+_token_usage_window: deque = deque()  # (timestamp, estimated_tokens)
+_token_lock = threading.Lock()
+
+def _estimate_tokens(system: str, user: str) -> int:
+    # ~4 chars/token is the standard rough estimate; add a buffer for the model's own
+    # (often substantial, since gpt-oss-120b is a reasoning model) output + reasoning tokens.
+    return (len(system) + len(user)) // 4 + 400
+
+def _reserve_token_budget(estimated: int) -> bool:
+    """Returns True and reserves the tokens if there's room in the current 60s window,
+    False if this call should be skipped to avoid a near-certain 429."""
+    now = time.time()
+    with _token_lock:
+        while _token_usage_window and _token_usage_window[0][0] < now - 60:
+            _token_usage_window.popleft()
+        used = sum(t for _, t in _token_usage_window)
+        if used + estimated > TPM_BUDGET:
+            return False
+        _token_usage_window.append((now, estimated))
+        return True
+# -----------------------------------------------------------------------------
+
 
 # Both /v1/tick and /v1/reply have a 30s budget from the judge. compose() can now make up
 # to 2 LLM calls (initial + one retry after a rejected fabrication), so each call's timeout
@@ -101,59 +135,34 @@ def _llm_complete(system: str, user: str, temperature: float = 0.0) -> str:
 
 
 # Prompt templates per trigger kind
-SYSTEM_PROMPT = """You are Vera, magicpin's AI merchant assistant. You compose WhatsApp messages that
-engage Indian merchants or their customers. You ALWAYS return valid JSON with these exact keys:
-{"body": "...", "cta": "...", "send_as": "...", "suppression_key": "...", "rationale": "..."}
+# NOTE: kept deliberately terse -- your Groq account is capped at 8K tokens/minute for
+# this model, so every token here is budget taken away from actually being able to make
+# more than a handful of calls per minute. Verbosity here has a real, measured cost.
+SYSTEM_PROMPT = """You are Vera, magicpin's AI merchant assistant. Compose WhatsApp messages for Indian merchants/customers.
+Return ONLY this JSON: {"body":"...","cta":"...","send_as":"...","suppression_key":"...","rationale":"..."}
 
-RULES (violating any costs heavy scoring penalty):
-1. body — the WhatsApp message text. No preamble ("Hope you're well" etc.), no re-introduction.
-   There is NO hard character limit — a longer message packed with real specifics beats a short
-   generic one. But don't pad: every sentence must earn its place. As a rough feel, the best
-   examples run ~250-450 characters; go longer only if you have that many real, non-fabricated
-   specifics to include.
-2. cta — one of: "binary_yes_no", "binary_confirm_cancel", "open_ended", "multi_choice_slot", "none"
-3. send_as — "vera" for merchant-facing, "merchant_on_behalf" for customer-facing
-4. suppression_key — copy from the trigger's suppression_key
-5. rationale — 1-2 sentences explaining the compulsion lever used and why this message fits.
-   Must accurately describe what the body actually does — a mismatched rationale is penalized.
-6. NEVER fabricate data not present in the context JSON provided. Every number, date, name, or
-   claim must trace back to something literally present in the context. If you compute a derived
-   number (e.g. "22 of your 240 chronic-Rx customers"), it must be arithmetically consistent with
-   the context values, not invented.
-7. NEVER use taboo words from the category voice profile.
-8. NEVER include a URL/link of any kind in body. Meta rejects them — this is an automatic hard
-   fail for the message, worse than any other mistake. If you want to reference content, describe
-   it instead of linking it.
-9. ALWAYS use the merchant's/owner's/customer's actual first name from the context. A generic
-   "Hi" or "Hello there" with no name loses points — never skip the name if one exists in context.
-10. ALWAYS anchor on at least one specific, verifiable number, date, or source citation from the
-    contexts. For any research or compliance-type trigger, you MUST include the source citation
-    (e.g. "— JIDA Oct 2026 p.14", "DCI circular 2026-11-04") — omitting it caps the message's
-    specificity score.
-11. Hindi-English code-mix is ENCOURAGED for hi/hi-en merchants and customers — don't force pure
-    English on a merchant/customer whose language preference includes Hindi.
-12. Exactly ONE primary call-to-action, and it must land in the LAST sentence — buried or stacked
-    CTAs ("Reply YES for X, NO for Y, or tell us Z") lose points. One clear, low-friction next step.
-13. "X% off" generic discounts score LOWER than "Service @ ₹price" specifics — always prefer the
-    concrete service+price from the offer catalog when one exists and is relevant.
-14. For customer-facing messages: honor language preference, preferred slot times, and
-    relationship/consent state exactly as given — never invent customer details not in context.
-15. Emoji: 1 max, only if it fits the category (🦷 dental, 💇 salon, 🏋️ gym, 💍 bridal — never for
-    pharmacies, which stay trustworthy/precise with no emoji).
-16. Use the category's own vocabulary (voice.vocab_allowed) naturally where it fits — using the
-    right domain terms signals real category understanding and is explicitly rewarded.
-17. Where the data supports it, add a judgment call, not just a template fill — e.g. recommending
-    a merchant SKIP a promo because the data says it will underperform. This "the bot has an
-    opinion, not just a mail-merge" quality is the single highest signal of category understanding.
-18. Do not stack more than one ask on the merchant/customer. One question, one CTA, one artifact
-    offered — not three.
-19. CategoryContext's offer_catalog and vocab_allowed are STYLE/PATTERN REFERENCE ONLY — canonical
-    examples of what offers/vocabulary look like in this vertical. They are NOT evidence that THIS
-    merchant currently has that specific offer, class, or service. Only claim a specific service,
-    class, or offer exists for this merchant if it appears in the merchant's own `offers` list
-    (status=active) or elsewhere in their own MerchantContext. This matters most for
-    customer-facing messages: never tell a customer "we've added X" or "we now offer X" unless X is
-    confirmed in the merchant's own active offers — a customer may show up expecting it.
+Rules:
+1. body: no preamble/re-intro. No hard length cap but don't pad -- ~250-450 chars is the sweet spot.
+2. cta: one of binary_yes_no | binary_confirm_cancel | open_ended | multi_choice_slot | none
+3. send_as: "vera" (merchant-facing) or "merchant_on_behalf" (customer-facing)
+4. suppression_key: copy from trigger
+5. rationale: 1-2 sentences, must match what body actually does
+6. NEVER fabricate: every number/date/name/claim must trace to the context given. Derived math (e.g. "22 of 240") must be arithmetically consistent.
+7. Never use category voice_taboo words.
+8. Never include a URL -- automatic hard fail.
+9. Always use the real first name from context -- never a bare "Hi".
+10. Anchor on >=1 verifiable number/date/citation. Research/compliance triggers MUST cite source.
+11. Hindi-English code-mix OK/encouraged for hi/hi-en merchants.
+12. Exactly ONE cta, in the LAST sentence. No stacked asks.
+13. Prefer "Service @ Rs price" over generic "X% off".
+14. Customer-facing: honor language/slot-preference/consent exactly; never invent customer detail.
+15. Emoji: 1 max, category-fitting, never for pharmacies.
+16. Use category vocab_allowed naturally where it fits.
+17. Add real judgment (e.g. "skip this promo, data says it underperforms") over template-filling.
+18. One ask only -- not three.
+19. Category offer_catalog/vocab_allowed = STYLE REFERENCE ONLY, not proof this merchant has it. Only
+claim a specific service/class/offer if it's in THIS merchant's own active `offers` -- especially for
+customer-facing "we've added X" claims.
 """
 
 COMPOSE_PROMPT = """=== CONTEXT ===
@@ -510,8 +519,8 @@ def compose(
     signals = merchant.get("signals", [])
     convo = merchant.get("conversation_history", [])
     convo_summary = [
-        f"[{t.get('from','?')} @ {t.get('ts','')}]: {t.get('body','')[:120]}"
-        for t in convo[-3:]
+        f"[{t.get('from','?')} @ {t.get('ts','')[:10]}]: {t.get('body','')[:80]}"
+        for t in convo[-1:]
     ] if convo else ["(no recent conversation)"]
 
     peer_ctr = peer_stats.get("avg_ctr", 0.03)
@@ -532,18 +541,18 @@ def compose(
     if top_item_id:
         relevant_digest = [d for d in digest if d.get("id") == top_item_id]
     if not relevant_digest:
-        relevant_digest = digest[:3]  # top 3 by default
+        relevant_digest = digest[:1]  # only the single top item -- token budget is tight
 
     prompt = COMPOSE_PROMPT.format(
         slug=slug,
         voice_tone=voice.get("tone", ""),
-        taboos=voice.get("vocab_taboo", []),
-        offer_catalog=[o["title"] for o in category.get("offer_catalog", [])[:6]],
+        taboos=voice.get("vocab_taboo", [])[:5],
+        offer_catalog=[o["title"] for o in category.get("offer_catalog", [])[:4]],
         peer_stats={k: v for k, v in peer_stats.items() if k in
                     ("avg_ctr", "avg_rating", "avg_review_count", "avg_views_30d", "avg_calls_30d")},
         digest=relevant_digest,
-        seasonal_beats=seasonal_beats,
-        trend_signals=trend_signals[:3],
+        seasonal_beats=seasonal_beats[:2],
+        trend_signals=trend_signals[:2],
         merchant_id=merchant.get("merchant_id", ""),
         merchant_name=identity.get("name", ""),
         owner_name=identity.get("owner_first_name", ""),
@@ -561,7 +570,7 @@ def compose(
         signals=signals,
         convo_history=convo_summary,
         customer_aggregate=merchant.get("customer_aggregate", {}),
-        review_themes=merchant.get("review_themes", []),
+        review_themes=merchant.get("review_themes", [])[:2],
         trigger_id=trigger.get("id", ""),
         trigger_kind=trigger_kind,
         trigger_source=trigger.get("source", ""),
@@ -576,6 +585,20 @@ def compose(
     def _try_llm_compose(extra_instruction: str = "") -> tuple:
         """One LLM attempt. Returns (parsed dict or None, error string or None)."""
         full_prompt = prompt + (f"\n\n{extra_instruction}" if extra_instruction else "")
+        estimated = _estimate_tokens(SYSTEM_PROMPT, full_prompt)
+        try:
+            has_budget = _reserve_token_budget(estimated)
+        except Exception:
+            has_budget = True  # fail OPEN -- a bug in the guard itself must never be able
+            # to take down real composition (this exact failure mode was observed: an
+            # unrelated NameError in this guard silently zeroed out every single action
+            # for a full test run before this fix).
+        if not has_budget:
+            return None, (
+                f"token budget guard: ~{estimated} tokens needed but the rolling 60s window "
+                f"is already near the {TPM_BUDGET} TPM cap -- skipping to avoid a near-certain "
+                f"429 and preserve remaining budget for other in-flight requests"
+            )
         try:
             raw = _llm_complete(SYSTEM_PROMPT, full_prompt, temperature=0.0)
             raw = re.sub(r"^```[a-z]*\n?", "", raw.strip())
