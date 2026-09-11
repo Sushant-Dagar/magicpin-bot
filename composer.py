@@ -699,6 +699,13 @@ def compose(
 
 def _harvest_facts(payload: dict, limit: int = 4) -> list:
     """Pull message-worthy facts (numbers, dates, short labels) from any payload."""
+    if not payload or payload.get("placeholder") is True:
+        # Thin/placeholder trigger (real gap in the dataset: ~75% of expanded triggers
+        # are just {"placeholder": true, "metric_or_topic": kind}) -- there is nothing
+        # genuinely informative to harvest here. Returning [] forces the caller to lean
+        # on merchant/category-level facts instead of echoing the placeholder's own
+        # field name back as if it were a real detail (e.g. "metric or topic: X").
+        return []
     out = []
     def walk(o, prefix="", depth=0):
         if depth > 4 or len(out) > limit * 3:
@@ -768,11 +775,38 @@ def _fallback_compose(category: dict, merchant: dict, trigger: dict, customer: O
                 "suppression_key": trigger.get("suppression_key", ""),
                 "rationale": "Fallback: customer message with payload facts, single CTA."}
 
-    body = f"{name}, flagging {kind}" + (f" for your {loc} listing" if loc else "") + " right now."
+    # Merchant-facing. If the trigger payload was a real, populated one, lead with those
+    # specifics. If it was a thin placeholder (facts == []), lean on merchant-level
+    # context instead of a vague "I've lined up the next step" non-answer, and phrase the
+    # kind naturally rather than echoing the raw snake_case trigger kind.
+    kind_natural = kind  # already de-snake-cased above
+    active_offers = [o["title"] for o in merchant.get("offers", []) if o.get("status") == "active"]
+    signals = merchant.get("signals", [])
+
     if facts:
-        body += " Key details: " + "; ".join(facts) + "."
-    body += stat
-    body += " I've lined up the recommended next step — reply YES and I'll walk you through it."
-    return {"body": smart_trim(body), "cta": "binary_yes_no", "send_as": "vera",
+        body = f"{name}, heads up on {kind_natural}" + (f" for your {loc} listing" if loc else "") + "."
+        body += " " + "; ".join(facts) + "."
+        body += stat
+        body += " Want me to put together next steps for this?"
+    else:
+        # No usable trigger-level facts -- ground the message in real merchant data instead
+        # of the trigger payload, and ask a concrete, specific question rather than a
+        # generic "reply YES to know more".
+        body = f"{name}, a {kind_natural} update for your {loc or category.get('slug', 'business')} listing."
+        if stat:
+            body += stat
+        elif active_offers:
+            body += f" Your active offer right now is {active_offers[0]}."
+        elif signals:
+            body += f" Noting: {signals[0].replace('_', ' ')}."
+        body += " Want me to look into how this affects your listing and suggest a next step?"
+
+    return {"body": smart_trim(body), "cta": "binary_yes_no" if facts else "open_ended",
+            "send_as": "vera",
             "suppression_key": trigger.get("suppression_key", ""),
-            "rationale": f"Fallback for '{kind}': payload facts + merchant anchors, no fabrication."}
+            "rationale": (
+                f"Fallback for '{kind}': payload facts + merchant anchors, no fabrication."
+                if facts else
+                f"Fallback for '{kind}': trigger payload was a thin placeholder, grounded in "
+                f"merchant-level data instead rather than echoing the placeholder's own field names."
+            )}
