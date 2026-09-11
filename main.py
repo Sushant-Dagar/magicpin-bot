@@ -46,6 +46,17 @@ sent_suppression_keys: set = set()
 # (phase-4 spec: "suppressing all future triggers for this merchant")
 hostile_merchants: set = set()
 
+# Global lock protecting the shared state dicts/sets above (contexts, conversations,
+# sent_suppression_keys, hostile_merchants, merchant_auto_reply_counts) from read-modify-
+# write races. FastAPI runs sync route handlers in a thread pool, and /v1/tick
+# deliberately runs multiple jobs concurrently (see below) -- without this, two
+# overlapping requests (e.g. two /v1/context pushes for the same key, or a /v1/tick and
+# /v1/reply landing at the same moment) could race on a "check current value, then write"
+# sequence and silently lose an update. Scoped tightly around the actual dict/set
+# operations only -- NEVER held across an LLM call, which would serialize requests and
+# undo the concurrency work in /v1/tick.
+_state_lock = threading.Lock()
+
 # Global cap on concurrent LLM calls across ALL in-flight /v1/tick and /v1/reply requests
 # combined -- not per-request. Observed failure mode: the judge's client-side timeout
 # fires and it sends a NEW tick request while the OLD one is still running server-side;
@@ -196,16 +207,17 @@ def push_context(body: ContextBody):
             "details": f"scope must be one of {sorted(valid_scopes)}"})
 
     key = (body.scope, body.context_id)
-    current = contexts.get(key)
+    with _state_lock:
+        current = contexts.get(key)
 
-    if current and current["version"] > body.version:
-        return JSONResponse(status_code=409, content={
-            "accepted": False, "reason": "stale_version",
-            "current_version": current["version"]})
+        if current and current["version"] > body.version:
+            return JSONResponse(status_code=409, content={
+                "accepted": False, "reason": "stale_version",
+                "current_version": current["version"]})
 
-    # same version = idempotent re-push → accept silently (spec requirement)
-    if not (current and current["version"] == body.version):
-        contexts[key] = {"version": body.version, "payload": body.payload}
+        # same version = idempotent re-push → accept silently (spec requirement)
+        if not (current and current["version"] == body.version):
+            contexts[key] = {"version": body.version, "payload": body.payload}
     _save_state()
     return {
         "accepted": True,
@@ -228,41 +240,55 @@ def tick(body: TickBody):
     # latency to roughly the slowest single trigger, not the sum of all of them.
     eligible = []  # list of (trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer)
 
-    for trg_id in body.available_triggers:
-        trg = _get_trigger(trg_id)
-        if not trg:
-            continue
+    with _state_lock:
+        for trg_id in body.available_triggers:
+            trg = _get_trigger(trg_id)
+            if not trg:
+                continue
 
-        sup_key = trg.get("suppression_key", "")
-        if sup_key in sent_suppression_keys:
-            continue
+            sup_key = trg.get("suppression_key", "")
+            if sup_key in sent_suppression_keys:
+                continue
 
-        merchant_id = trg.get("merchant_id")
-        customer_id = trg.get("customer_id")
-        if not merchant_id:
-            continue
-        if merchant_id in hostile_merchants:
-            continue
+            merchant_id = trg.get("merchant_id")
+            customer_id = trg.get("customer_id")
+            if not merchant_id:
+                continue
+            if merchant_id in hostile_merchants:
+                continue
 
-        conv_id = f"conv_{merchant_id}_{trg_id}"
-        existing_conv = conversations.get(conv_id)
-        if existing_conv and (existing_conv.get("ended") or
-                              len(existing_conv.get("turns", [])) > 0):
-            continue
+            conv_id = f"conv_{merchant_id}_{trg_id}"
+            existing_conv = conversations.get(conv_id)
+            if existing_conv and (existing_conv.get("ended") or
+                                  existing_conv.get("reserved") or
+                                  len(existing_conv.get("turns", [])) > 0):
+                continue
 
-        merchant = _get_merchant(merchant_id)
-        if not merchant:
-            continue
+            merchant = _get_merchant(merchant_id)
+            if not merchant:
+                continue
 
-        category = _get_category_for_merchant(merchant)
-        if not category:
-            continue
+            category = _get_category_for_merchant(merchant)
+            if not category:
+                continue
 
-        customer = _get_customer(customer_id) if customer_id else None
+            customer = _get_customer(customer_id) if customer_id else None
 
-        eligible.append((trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer))
-        if len(eligible) >= 20:
-            break
+            # Reserve immediately, inside the lock: this closes a real race we observed
+            # happen tonight (the judge's client timed out and retried while an earlier
+            # /v1/tick was still processing the same trigger) -- without this, the same
+            # trigger could be picked up as "eligible" by two overlapping tick calls and
+            # composed twice. A bare reservation with no turns would NOT have been
+            # skipped by the pre-existing check above, so it needs its own explicit flag.
+            conversations[conv_id] = {"reserved": True, "turns": [], "merchant_id": merchant_id,
+                                       "customer_id": customer_id, "trigger_id": trg_id,
+                                       "ended": False}
+            if sup_key:
+                sent_suppression_keys.add(sup_key)
+
+            eligible.append((trg_id, sup_key, merchant_id, customer_id, conv_id, trg, merchant, category, customer))
+            if len(eligible) >= 20:
+                break
 
     print(f"[TICK] eligibility pass done at +{time.time()-_t0:.2f}s, {len(eligible)} eligible: {[e[0] for e in eligible]}")
 
@@ -321,12 +347,24 @@ def tick(body: TickBody):
 
                 if err is not None:
                     print(f"[TICK] Compose error for {trg_id}: {err}")
+                    with _state_lock:
+                        conversations.pop(conv_id, None)
+                        if sup_key:
+                            sent_suppression_keys.discard(sup_key)
                     continue
                 if result is None:
+                    with _state_lock:
+                        conversations.pop(conv_id, None)
+                        if sup_key:
+                            sent_suppression_keys.discard(sup_key)
                     continue
 
                 body_text = result.get("body", "").strip()
                 if not body_text:
+                    with _state_lock:
+                        conversations.pop(conv_id, None)
+                        if sup_key:
+                            sent_suppression_keys.discard(sup_key)
                     continue
 
                 kind = trg.get("kind", "generic")
@@ -340,6 +378,10 @@ def tick(body: TickBody):
                 # already applies a generous sanity ceiling. Re-run the URL guard defensively.
                 body_text = strip_urls(body_text)
                 if not body_text:
+                    with _state_lock:
+                        conversations.pop(conv_id, None)
+                        if sup_key:
+                            sent_suppression_keys.discard(sup_key)
                     continue
 
                 action_entry = {
@@ -360,23 +402,38 @@ def tick(body: TickBody):
 
                 _payload = trg.get("payload", {})
                 _slots_raw = _payload.get("available_slots") or _payload.get("next_session_options") or []
-                conversations[conv_id] = {
-                    "slots": [s.get("label", str(s)) if isinstance(s, dict) else str(s) for s in _slots_raw],
-                    "turns": [{"from": "bot", "msg": body_text}],
-                    "merchant_id": merchant_id,
-                    "customer_id": customer_id,
-                    "trigger_id": trg_id,
-                    "trigger_kind": kind,
-                    "ended": False,
-                    "turn_number": 1,
-                    "auto_reply_count": 0,
-                }
-
-                if sup_key:
-                    sent_suppression_keys.add(sup_key)
+                with _state_lock:
+                    conversations[conv_id] = {
+                        "slots": [s.get("label", str(s)) if isinstance(s, dict) else str(s) for s in _slots_raw],
+                        "turns": [{"from": "bot", "msg": body_text}],
+                        "merchant_id": merchant_id,
+                        "customer_id": customer_id,
+                        "trigger_id": trg_id,
+                        "trigger_kind": kind,
+                        "ended": False,
+                        "turn_number": 1,
+                        "auto_reply_count": 0,
+                    }
+                    if sup_key:
+                        sent_suppression_keys.add(sup_key)  # already added at reservation; idempotent
 
                 if len(actions) >= 20:
                     break
+
+            # Deadline-abandoned jobs (still running when we stopped waiting) were
+            # reserved during the eligibility pass but will never reach the loop above --
+            # release their reservation so a future tick can pick the trigger back up
+            # instead of it being stuck "reserved" forever.
+            if not_done:
+                with _state_lock:
+                    for fut in not_done:
+                        # We don't have the job tuple for a still-running future directly,
+                        # but futures_wait preserves order with `futures`/`eligible`.
+                        idx = futures.index(fut)
+                        _trg_id, _sup_key, _mid, _cid, _conv_id, *_ = eligible[idx]
+                        conversations.pop(_conv_id, None)
+                        if _sup_key:
+                            sent_suppression_keys.discard(_sup_key)
         finally:
             # wait=False: don't block here either. Any not_done jobs keep running in the
             # background and will release their semaphore slot / update nothing shared
@@ -397,56 +454,58 @@ def reply(body: ReplyBody):
     merchant_id = body.merchant_id
     customer_id = body.customer_id
 
-    # Fetch or create conversation state
-    conv = conversations.get(conv_id)
-    if not conv:
-        conv = {
-            "turns": [],
-            "merchant_id": merchant_id,
-            "customer_id": customer_id,
-            "trigger_id": "",
-            "trigger_kind": "unknown",
-            "ended": False,
-            "turn_number": body.turn_number,
-            "auto_reply_count": 0,
-        }
-        conversations[conv_id] = conv
+    with _state_lock:
+        # Fetch or create conversation state
+        conv = conversations.get(conv_id)
+        if not conv:
+            conv = {
+                "turns": [],
+                "merchant_id": merchant_id,
+                "customer_id": customer_id,
+                "trigger_id": "",
+                "trigger_kind": "unknown",
+                "ended": False,
+                "turn_number": body.turn_number,
+                "auto_reply_count": 0,
+            }
+            conversations[conv_id] = conv
 
-    if conv.get("ended"):
-        return {"action": "end", "rationale": "Conversation already ended."}
+        if conv.get("ended"):
+            return {"action": "end", "rationale": "Conversation already ended."}
 
-    # Safety: end after 10 turns
-    if body.turn_number > 10:
-        conv["ended"] = True
-        return {"action": "end", "rationale": "Maximum conversation turns reached."}
+        # Safety: end after 10 turns
+        if body.turn_number > 10:
+            conv["ended"] = True
+            return {"action": "end", "rationale": "Maximum conversation turns reached."}
 
-    resolved_merchant_id = conv.get("merchant_id") or merchant_id
+        resolved_merchant_id = conv.get("merchant_id") or merchant_id
 
-    # --- Merchant-level auto-reply tracking ---
-    # CRITICAL: the judge sends each turn on a different conv_id, so we must
-    # track consecutive auto-replies at the merchant level, not per-conversation.
-    if resolved_merchant_id:
-        if is_auto_reply(merchant_message):
-            merchant_auto_reply_counts[resolved_merchant_id] = \
-                merchant_auto_reply_counts.get(resolved_merchant_id, 0) + 1
-        else:
-            merchant_auto_reply_counts[resolved_merchant_id] = 0
-        # Write it into conv so conversation_handlers.py sees it
-        conv["auto_reply_count"] = merchant_auto_reply_counts[resolved_merchant_id]
+        # --- Merchant-level auto-reply tracking ---
+        # CRITICAL: the judge sends each turn on a different conv_id, so we must
+        # track consecutive auto-replies at the merchant level, not per-conversation.
+        if resolved_merchant_id:
+            if is_auto_reply(merchant_message):
+                merchant_auto_reply_counts[resolved_merchant_id] = \
+                    merchant_auto_reply_counts.get(resolved_merchant_id, 0) + 1
+            else:
+                merchant_auto_reply_counts[resolved_merchant_id] = 0
+            # Write it into conv so conversation_handlers.py sees it
+            conv["auto_reply_count"] = merchant_auto_reply_counts[resolved_merchant_id]
 
-    # Record incoming turn
-    conv["turns"].append({"from": body.from_role, "msg": merchant_message})
-    conv["turn_number"] = body.turn_number
-    conv["from_role"] = body.from_role
+        # Record incoming turn
+        conv["turns"].append({"from": body.from_role, "msg": merchant_message})
+        conv["turn_number"] = body.turn_number
+        conv["from_role"] = body.from_role
+        resolved_customer_id = conv.get("customer_id") or customer_id
+        conv["customer_id"] = resolved_customer_id
 
-    # Fetch fresh context
-    resolved_customer_id = conv.get("customer_id") or customer_id
+    # Everything below reads contexts (safe: plain dict .get() reads are atomic under the
+    # GIL) and may make an LLM call -- deliberately OUTSIDE the lock so a slow LLM call
+    # here can't block other requests from acquiring _state_lock.
     merchant = _get_merchant(resolved_merchant_id) if resolved_merchant_id else None
     category = _get_category_for_merchant(merchant) if merchant else None
     customer = _get_customer(resolved_customer_id) if resolved_customer_id else None
 
-    # Pass conv directly — mutations inside respond() persist (e.g. ended flag)
-    conv["customer_id"] = resolved_customer_id
     # Same global semaphore as /v1/tick -- a concurrent tick batch and a reply call
     # shouldn't be able to independently stack extra LLM load on top of each other.
     _reply_t0 = time.time()
@@ -459,16 +518,17 @@ def reply(body: ReplyBody):
         result = {"action": "wait", "wait_seconds": 30,
                   "rationale": "LLM capacity busy with other in-flight requests; backing off briefly."}
 
-    action = result.get("action", "send")
-    if action == "send":
-        conv["turns"].append({"from": "bot", "msg": result.get("body", "")})
-    elif action == "end":
-        conv["ended"] = True
-        # Also clear the merchant auto-reply count so future conversations start fresh
-        if resolved_merchant_id:
-            merchant_auto_reply_counts.pop(resolved_merchant_id, None)
-            if result.get("suppress_merchant"):
-                hostile_merchants.add(resolved_merchant_id)
+    with _state_lock:
+        action = result.get("action", "send")
+        if action == "send":
+            conv["turns"].append({"from": "bot", "msg": result.get("body", "")})
+        elif action == "end":
+            conv["ended"] = True
+            # Also clear the merchant auto-reply count so future conversations start fresh
+            if resolved_merchant_id:
+                merchant_auto_reply_counts.pop(resolved_merchant_id, None)
+                if result.get("suppress_merchant"):
+                    hostile_merchants.add(resolved_merchant_id)
 
     response = {"action": action, "rationale": result.get("rationale", "")}
     if action == "send":
